@@ -1,0 +1,22 @@
+# One website per line. Lines starting with # are ignored.
+# A line can be a homepage, a careers page, or the job board itself, optionally
+# with a name first:  "AstraZeneca, https://careers.astrazeneca.com"
+# (useful when a homepage blocks the script). A CSV with "company" and "url"
+# columns also works.
+
+# Pharma / CRO
+pfizer.com
+gene.com
+medpace.com
+# Biotech / tools
+illumina.com
+benchling.com
+# Agricultural
+corteva.com
+# Diagnostics (human / veterinary)
+idexx.com
+zoetis.com
+werfen.com
+# Computational
+schrodinger.com
+certara.com

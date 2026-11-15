@@ -1,0 +1,148 @@
+# Career Sifter
+
+Finds the careers / job-listings page for a list of company websites
+(pharma, biotech, ag, diagnostics, computational science, ...).
+
+## Setup
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+Optional, for JavaScript-heavy sites:
+
+```powershell
+.\.venv\Scripts\python -m pip install playwright
+.\.venv\Scripts\python -m playwright install chromium
+```
+
+## Usage
+
+```powershell
+.\.venv\Scripts\python find_careers.py sites.example.txt -o results.csv
+```
+
+Input is a `.txt` (one site per line, `#` comments allowed, optionally
+`Company Name, URL`) or a `.csv` with a `url`/`website` column (and optional
+`company` column).
+
+Each entry can be:
+- a **homepage** (`pfizer.com`): the normal case;
+- a **careers page** (`https://careers.astrazeneca.com`): useful when the homepage
+  blocks the script; the finder works from there to the job board;
+- the **job board itself** (`https://pfizer.wd1.myworkdayjobs.com/PfizerCareers`):
+  recognised and used as-is (`method` = `input-is-board`), no crawling. The company
+  name is taken from the board URL unless you give one.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--workers` | 8 | sites scanned in parallel |
+| `--delay` | 0.5 | seconds between requests to the same site |
+| `--timeout` | 15 | per-request timeout |
+| `--verify` | 3 | top candidate links to fetch and check |
+| `--render` | off | headless browser fallback for JS-rendered pages |
+| `--ignore-robots` | off | skip robots.txt checks |
+
+## How it finds the page
+
+1. Scores every homepage link by text ("Careers", "Join us", "See openings", ...),
+   URL path (`/careers`, `/jobs`), subdomain (`careers.`, `jobs.`) and whether it
+   points at a known applicant-tracking system (Workday, Greenhouse, Lever, iCIMS,
+   SmartRecruiters, Taleo, SuccessFactors, Ashby, Eightfold, Phenom, ...).
+2. Falls back to probing common paths, then the sitemap.
+3. Fetches the top candidates and scores their content (JobPosting schema,
+   ATS links/embeds, "search jobs" phrases, page title).
+4. Follows the careers landing page through to the actual listings and
+   normalises ATS links to the board root (skipping employee-only portals and login pages).
+5. If no job board is visible (many load from JavaScript), tries the usual board
+   addresses built from the domain name: Workday (`<name>.wdN.myworkdayjobs.com`,
+   locating the data centre first, then common site names), `careers-<name>.icims.com`,
+   `boards.greenhouse.io/<name>`, etc. These rows are marked `ats-probe` in `method`;
+   check they belong to the right company. If a Workday tenant exists but its site
+   name can't be guessed, the notes say so; paste the board URL as input instead.
+6. If the homepage blocks the script, starts from `careers.<domain>` / `jobs.<domain>`.
+
+For universities, student "Career Center" pages are scored down in favour of
+employment / HR job pages, and academic ranks (Assistant/Associate Professor,
+Professor, Dean, Provost, Chair) feed the career-level tagging.
+
+## Output columns
+
+`status` is `listings_found`, `careers_page_found`, `not_found`, `blocked` (the homepage
+refused us) or `error`. `rejected_requests` records every host that refused a request,
+with the HTTP status and the bot-protection service when recognisable, e.g.
+`www.lilly.com 403 Cloudflare` (also Akamai, CloudFront, AWS WAF, Imperva, DataDome,
+CAPTCHA). Refusals never stop the run; they are just recorded.
+`careers_url` is the landing page, `listings_url` the page/board with openings,
+`ats` the detected platform, `score` a relative confidence, `method` which step
+found it, `top_candidates` the runner-up links for manual review.
+
+Keyword weights, ATS patterns and probe paths are at the top of `find_careers.py`.
+
+## Step 2: collect and classify openings
+
+```powershell
+.\.venv\Scripts\python fetch_jobs.py careers_results.csv --keywords "python,bioinformatics,GMP"
+```
+
+For every company whose job board is supported (Workday, Greenhouse, Lever, Ashby,
+SmartRecruiters, Eightfold, Phenom, iCIMS, Attrax, Oracle Recruiting Cloud, PeopleAdmin) it:
+
+1. Counts **all openings** worldwide.
+2. Down-selects to **US openings**, using the board's own country filter when it has
+   one (Workday) or the job's structured/parsed location otherwise.
+3. Fetches each US job's description and tags:
+   - **state / city**
+   - **minimum education** mentioned (High school/GED → Associate → Bachelor's →
+     Master's → PhD / Professional doctorate, or Not stated)
+   - **minimum years of experience** mentioned
+   - **career level**: early / mid / senior / executive / unspecified, from the title
+     first, then the board's own level label, then years of experience
+   - any `--keywords` found in the title or description
+
+Output (in `output/`):
+
+| File | Contents |
+|---|---|
+| `summary.csv` | per company + ALL: status, rejected requests (from both steps, with counts), total, US count and %, top states, education and level counts, keyword counts. Blocked companies stay listed. |
+| `us_locations.csv` | US openings per company / state / city |
+| `jobs.csv` | one row per US job with all tags and its URL |
+| `jobs.jsonl` | the same jobs including full description text |
+
+Useful flags: `--all-locations` (tag non-US jobs too), `--max-jobs 20` (quick test),
+`--keywords @keywords.txt` (one per line), `--delay`, `--workers`, `--detail-workers`.
+
+The tagging rules live in `classify.py`; `python test_classify.py` checks them.
+
+iCIMS covers both classic portals (`careers-<co>.icims.com`, read from the search
+pages plus each job's schema.org data) and iCIMS career sites (`careers.<co>.com`,
+read from their `/api/jobs` feed); a portal that redirects to a career site is
+followed.
+
+All requests identify honestly as `CareerSifter/0.1 (job-market research script)`
+rather than imitating a browser (iCIMS rejects browser-style agents from scripts).
+
+Other platforms:
+- **Attrax** (e.g. careers.abbvie.com): job tiles from `/<lang>/jobs`, descriptions from
+  each job page's schema.org data; the site's own "Experience Level" feeds career level.
+- **Oracle Recruiting Cloud** (e.g. careersearch.stanford.edu): the site's public
+  `recruitingCE` REST API.
+- **PeopleAdmin** (US universities, e.g. jobs.ncsu.edu): the `/postings/search.atom`
+  feed plus each posting's field table. Postings count as US; the state is filled
+  only when a location field or the description names one.
+
+US jobs that only name a site ("TARRYTOWN", "Lincoln") get their state from the same
+company's other postings ("Tarrytown, NY") or from "<city>, <state>" in the description.
+
+**robots.txt:** both scripts respect it by default. Some job boards disallow scripts:
+SmartRecruiters' API, Eightfold's API and PeopleAdmin's default robots.txt all do.
+Those companies are reported as `robots_disallowed` in `summary.csv` rather than
+collected. `--ignore-robots` (on either script) overrides this; use it only if you
+are comfortable doing so for the sites concerned.
+
+Known gaps: Taleo and SuccessFactors boards are reported as `unsupported_ats`;
+companies with no detected board are `no_ats`. Niche university systems (Peopleclick,
+Clinch, Paradox, custom portals) are not supported. Some Workday boards
+list bare site names ("Lincoln") with no state, so those jobs show under
+`(not given)` with the site name as city.
