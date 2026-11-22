@@ -20,22 +20,23 @@ addresses. `fetch_jobs.py` reads the openings from those boards, tags them, and 
 files and the SQLite database.
 
 ```mermaid
+%%{init: {"flowchart": {"htmlLabels": false}} }%%
 flowchart LR
-    input["sites.txt / sites.csv<br/>homepages, careers pages<br/>or job-board URLs"]
+    input["sites.txt or sites.csv<br/>homepages, careers<br/>pages or board URLs"]
     known[("known_sites.csv<br/>saved boards and<br/>manual-check notes")]
     fc["find_careers.py<br/>SiteScanner"]
     results["careers_results.csv<br/>one row per company"]
     fj["fetch_jobs.py"]
-    clients["ats_clients.py<br/>11 job-board adapters"]
+    clients["ats_clients.py<br/>11 job-board<br/>adapters"]
     tag["classify.py<br/>job_details.py"]
-    out["output/<br/>summary.csv, us_locations.csv,<br/>jobs.csv, jobs.jsonl"]
+    out["output folder<br/>summary.csv<br/>us_locations.csv<br/>jobs.csv, jobs.jsonl"]
     db[("career_sifter.db<br/>SQLite")]
     web(("company sites<br/>and job boards"))
-    tools["DB Browser / sqlite3 /<br/>R / pandas / Docker"]
+    tools["DB Browser, sqlite3,<br/>R, pandas, Docker"]
 
     input --> fc
     known <--> fc
-    fc <-->|"HTTP, robots.txt respected,<br/>refusals recorded"| web
+    fc <-->|"HTTP, robots.txt<br/>respected, refusals<br/>recorded"| web
     fc --> results --> fj
     fj --> clients
     clients <-->|"job-board APIs<br/>and pages"| web
@@ -52,38 +53,39 @@ What `SiteScanner.scan()` does for one input row. Every path ends in a status
 note when a person needs to look, and an update to `known_sites.csv`.
 
 ```mermaid
+%%{init: {"flowchart": {"htmlLabels": false}} }%%
 flowchart TD
     start(["input row"]) --> saved{"saved entry in<br/>known_sites.csv?"}
-    saved -->|"no job board, checked<br/>under 30 days ago"| skip["skip: 0 requests<br/>repeat manual_check note"]
-    saved -->|"has job board<br/>or careers page"| useSaved["start from the saved<br/>board or careers page"]
-    saved -->|"no, or --refresh"| kind{"what is the URL?<br/>classify_input"}
+    saved -->|"no board, checked<br/>within 30 days"| skip["skip: 0 requests,<br/>repeat the<br/>manual-check note"]
+    saved -->|"has board or<br/>careers page"| useSaved["start from the<br/>saved board or<br/>careers page"]
+    saved -->|"no, or --refresh"| kind{"what kind<br/>of URL?"}
     useSaved -->|works| done
-    useSaved -->|"404 / failed"| kind
+    useSaved -->|"404 or failed"| kind
 
-    kind -->|"job board<br/>Workday, Ashby, iCIMS..."| board["use it as-is<br/>no crawling"]
-    kind -->|"careers page<br/>careers. / jobs. / /careers"| careers["fetch the careers page<br/>homepage never requested"]
-    kind -->|homepage| home["fetch homepage<br/>try www. and http:// too"]
+    kind -->|"job board"| board["use it as-is,<br/>no crawling"]
+    kind -->|"careers page"| careers["fetch the careers<br/>page; homepage is<br/>never requested"]
+    kind -->|homepage| home["fetch the homepage<br/>(also www. and<br/>http://)"]
 
-    careers -->|refused or failed| search["workaround: site search pages<br/>/us/en/search-results, /en/jobs, ...<br/>stop after 3 refusals"]
+    careers -->|"refused or failed"| search["workaround:<br/>site search pages<br/>/us/en/search-results,<br/>/en/jobs, ...<br/>stop after 3 refusals"]
     search -->|loads| analyse
-    search -->|none load| probe
+    search -->|"none load"| probe
     careers -->|loads| analyse
 
-    home -->|loads| links["score every link<br/>careers, jobs, join us, ATS hosts"]
-    home -->|"refused, robots.txt,<br/>server error"| sub["workaround: careers.domain /<br/>jobs.domain, then their search pages"]
+    home -->|loads| links["score every link:<br/>careers, jobs, join us,<br/>job-board hosts"]
+    home -->|"refused, robots.txt<br/>or server error"| sub["workaround:<br/>careers.domain or<br/>jobs.domain, then<br/>their search pages"]
     sub -->|loads| analyse
-    sub -->|none load| probe
-    links -->|"no good link"| paths["probe /careers, /jobs, ...<br/>then the sitemap"]
-    links --> verify["fetch the top 3 candidates<br/>score their content"]
+    sub -->|"none load"| probe
+    links -->|"no good link"| paths["probe /careers,<br/>/jobs, ... then<br/>the sitemap"]
+    links --> verify["fetch the top 3<br/>candidates and<br/>score their content"]
     paths --> verify
-    verify --> analyse["analyse page<br/>JobPosting data, ATS links / embeds,<br/>listing phrases"]
-    analyse --> listings["follow to the listings<br/>one more hop if needed<br/>skip refused / login / internal links"]
+    verify --> analyse["analyse the page:<br/>JobPosting data,<br/>job-board links,<br/>listing phrases"]
+    analyse --> listings["follow to listings:<br/>one more hop if<br/>needed; skip refused,<br/>login, internal links"]
     listings -->|"ATS found"| done(["listings_found"])
     listings -->|"no ATS"| probe
 
-    probe["workaround: guess board addresses<br/>Workday: find data centre wdN, then site names<br/>iCIMS, Greenhouse, Lever, Ashby, SmartRecruiters"]
+    probe["workaround: guess<br/>board addresses:<br/>Workday data centre<br/>and site names; iCIMS,<br/>Greenhouse, Lever,<br/>Ashby, SmartRecruiters"]
     probe -->|found| done
-    probe -->|"nothing"| manual(["careers_page_found / not_found / blocked<br/>manual_check: open this page in a browser<br/>and paste the board into known_sites.csv"])
+    probe -->|nothing| manual(["careers_page_found,<br/>not_found or blocked,<br/>plus a manual-check<br/>note: open the page,<br/>paste the board into<br/>known_sites.csv"])
     board --> done
 ```
 
@@ -135,6 +137,8 @@ The main classes and how they relate. `SiteScanner` (in `find_careers.py`) produ
 per input row. Each `ATSClient` subclass turns one kind of job board into `Job` records, which
 `fetch_jobs.py` groups into a `CompanyReport`.
 
+### 4a. Finding the board (`find_careers.py`)
+
 ```mermaid
 classDiagram
     direction LR
@@ -176,6 +180,17 @@ classDiagram
         jobposting
     }
 
+    SiteScanner --> Result : fills
+    SiteScanner ..> Page : fetches
+    SiteScanner ..> PageSignals : analyze_page
+```
+
+### 4b. Collecting jobs (`ats_clients.py`, `fetch_jobs.py`)
+
+```mermaid
+classDiagram
+    direction TB
+
     class ATSClient {
         <<abstract>>
         +total_openings
@@ -215,9 +230,6 @@ classDiagram
         manual_check
     }
 
-    SiteScanner --> Result : fills
-    SiteScanner ..> Page : fetches
-    SiteScanner ..> PageSignals : analyze_page
     ATSClient <|-- WorkdayClient
     ATSClient <|-- GreenhouseClient
     ATSClient <|-- LeverClient
@@ -327,12 +339,13 @@ erDiagram
 internet and R checks.
 
 ```mermaid
+%%{init: {"flowchart": {"htmlLabels": false}} }%%
 flowchart LR
     t["test.py"]
-    i["installation checks<br/>Python, packages, SQLite,<br/>modules, write access"]
+    i["installation checks:<br/>Python, packages,<br/>SQLite, modules,<br/>write access"]
     py["test_classify.py<br/>test_job_details.py<br/>test_find_careers.py<br/>test_pipeline.py<br/>test_database.py"]
     fx[("tests/fixture.db<br/>known contents")]
-    live["--live<br/>benchling.com, both scripts"]
+    live["--live<br/>benchling.com,<br/>both scripts"]
     r["--r<br/>tests/run_r_tests.R"]
     rt["tests/testthat/<br/>test-database.R"]
     real[("career_sifter.db")]
