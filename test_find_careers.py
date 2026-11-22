@@ -87,10 +87,83 @@ def test_manual_check():
     assert "refuses scripts" in manual_check_note(Result(input_url="lilly.com", status="blocked"))
 
 
+# --------------------------------------------------------------------------- #
+# robots.txt and unreachable careers pages: skipped, with a message saying what to paste in
+# --------------------------------------------------------------------------- #
+
+def _scanner(input_url, careers_url="", status=404, robots_allows=True):
+    """A SiteScanner with the network stubbed out: every page answers `status`, nothing is guessed."""
+    import argparse
+    from find_careers import Page, SiteScanner
+    args = argparse.Namespace(ignore_robots=False, timeout=5, delay=0, render=False, verify=3)
+    s = SiteScanner(input_url, "", args, careers_url)
+    s.fetched = []
+    s.allowed = lambda url: robots_allows
+    s.probe_ats_boards = lambda: None  # guessed job-board addresses would need the network
+    real_get = s.get
+
+    def fake_get(url, record_rejection=True):
+        if not s.allowed(url):
+            return real_get(url, record_rejection)  # records the robots.txt skip; no request is made
+        return None  # e.g. sitemaps: unreachable
+
+    def fake_fetch(url):
+        s.fetched.append(url)
+        if not s.allowed(url):
+            return s.get(url)
+        return Page(url=url, status=status, html="<html><title>Example</title><a href='/about'>About</a></html>"
+                    if status == 200 else "")
+    s.get, s.fetch = fake_get, fake_fetch
+    return s
+
+
+def test_robots_and_unreachable_messages():
+    from find_careers import careers_failed_note, robots_note
+    msg = robots_note("https://corteva.eightfold.ai/careers?domain=corteva.com")
+    assert msg.startswith("skipped: robots.txt on corteva.eightfold.ai") and "careers search URL" in msg
+    msg = careers_failed_note("https://careers.example.com/")
+    assert "please manually check for the careers page URL or job search URL and try again" in msg
+    assert "careers_url" in msg and "listings_url" in msg  # says where to paste it
+
+
+def test_careers_url_that_fails_does_not_use_homepage():
+    s = _scanner("example.com", careers_url="https://careers.example.com/jobs-here")
+    r = s.scan()
+    assert r.status == "error" and r.input_type == "careers_page"
+    assert "please manually check for the careers page URL or job search URL" in r.manual_check
+    assert "https://careers.example.com/jobs-here" in r.manual_check
+    # only the careers host was tried (its page, then its usual search pages); never the homepage
+    assert s.fetched[0] == "https://careers.example.com/jobs-here"
+    assert all(u.startswith("https://careers.example.com/") for u in s.fetched), s.fetched
+    assert "homepage is not tried" in r.notes
+
+    # a careers page pasted as the input itself behaves the same way
+    r = _scanner("https://www.example.com/careers").scan()
+    assert r.status == "error" and "please manually check" in r.manual_check
+
+
+def test_robots_disallowed_site_is_skipped_with_message():
+    s = _scanner("https://careers.example.com/", robots_allows=False)
+    r = s.scan()
+    assert r.status == "error"
+    assert r.manual_check.startswith("skipped: robots.txt on careers.example.com")
+    assert "careers search URL" in r.manual_check
+    assert "robots.txt disallows" in r.notes
+    # a homepage blocked by robots.txt gets the robots message, not "could not load the site"
+    r = _scanner("example.com", robots_allows=False).scan()
+    assert r.manual_check.startswith("skipped: robots.txt on")
+    # a reachable site that just has no careers page keeps the search-for-it note
+    r = _scanner("example.com", status=200).scan()
+    assert r.status == "not_found" and "search 'example.com careers'" in r.manual_check
+
+
 if __name__ == "__main__":
     test_classify_input()
     test_load_sites_csv_careers_column()
     test_site_key()
     test_known_roundtrip()
     test_manual_check()
+    test_robots_and_unreachable_messages()
+    test_careers_url_that_fails_does_not_use_homepage()
+    test_robots_disallowed_site_is_skipped_with_message()
     print("all find_careers checks passed")

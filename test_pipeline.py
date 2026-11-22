@@ -327,6 +327,22 @@ def test_listing_completeness():
             assert (s["closed"], s["open_jobs"]) == (closed, still_open), (rep.ats, s)
 
 
+class RobotsBoard(FakeBoard):
+    name = "RobotsATS"
+
+    def list_jobs(self, us_only=True):
+        from ats_clients import RobotsDisallowed
+        raise RobotsDisallowed("robots.txt on fake.example disallows /api/jobs")
+
+
+def test_robots_disallowed_board_is_skipped_with_message():
+    rep = _run_fake(RobotsBoard, ignore_robots=False)
+    assert rep.status == "robots_disallowed" and rep.jobs == [] and rep.total_openings is None
+    assert rep.manual_check.startswith("skipped: robots.txt on fake.example")
+    assert "try again with that careers search URL" in rep.manual_check
+    assert any("try again with the company's careers search URL" in n for n in rep.notes)
+
+
 def test_capped_run_counts_whole_listing():
     capped = _run_fake(ManyBoard, max_jobs=3)
     assert len(capped.jobs) == 3                               # only the sample is classified and saved

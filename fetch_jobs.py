@@ -34,7 +34,7 @@ import database
 from ats_clients import CLIENTS, Job, RobotsDisallowed
 from classify import (EDU_NOT_STATED, EDU_ORDER, LEVEL_UNSPECIFIED, LEVELS, classify_education,
                       classify_level, infer_missing_states, min_years_experience)
-from find_careers import make_session, site_key
+from find_careers import make_session, robots_note, site_key
 from job_details import extract_details, extract_salary
 
 log = logging.getLogger("career_sifter.jobs")
@@ -147,9 +147,8 @@ def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pa
         jobs = client.list_jobs(us_only=not args.all_locations)
     except RobotsDisallowed as e:
         rep.status = "robots_disallowed"
-        rep.manual_check = (f"the job board asks scripts not to read it - open {board} in a browser "
-                            f"(or rerun with --ignore-robots)")
-        rep.notes.append(f"{e} - skipped (use --ignore-robots to override)")
+        rep.manual_check = robots_note(board)
+        rep.notes.append(f"{e} - skipped; try again with the company's careers search URL")
         rep.rejected_requests = finder_rejections
         return rep
     except Exception as e:

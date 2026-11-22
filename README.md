@@ -71,6 +71,13 @@ and links to Lilly's real Workday board. It stops after 3 refusals in a row (the
 host is then probably blocked). You can also paste a search URL directly as the
 careers page.
 
+**A careers page that won't load** (given in `careers_url`, pasted as the input, or saved)
+is not swapped for the homepage. After its search pages and the usual job-board addresses
+also fail, the row's `manual_check` says: *"the careers page ... could not be loaded -
+please manually check for the careers page URL or job search URL and try again"*. Paste
+the corrected URL into `careers_url` (or `listings_url` in `known_sites.csv`) and rerun.
+A *saved* careers page that stops working is still rediscovered from your input URL.
+
 ### Saved sites: discover once, reuse after
 
 Every successful scan is saved to `known_sites.csv` (one row per company, keyed by its
@@ -244,9 +251,13 @@ company's other postings ("Tarrytown, NY") or from "<city>, <state>" in the desc
 
 **robots.txt:** both scripts respect it by default. Some job boards disallow scripts:
 SmartRecruiters' API, Eightfold's API and PeopleAdmin's default robots.txt all do.
-Those companies are reported as `robots_disallowed` in `summary.csv` rather than
-collected. `--ignore-robots` (on either script) overrides this; use it only if you
-are comfortable doing so for the sites concerned.
+Those companies are skipped and reported as `robots_disallowed` in `summary.csv`, with a
+`manual_check` message: *"skipped: robots.txt on corteva.eightfold.ai asks scripts not to
+read ... - open the company's careers search page in a browser and try again with that
+careers search URL"*. Paste that URL into `careers_url` in the input (or `listings_url` in
+`known_sites.csv`) and rerun. The same message appears in `careers_results.csv` when a
+homepage or careers page itself is disallowed. `--ignore-robots` (on either script)
+overrides this; use it only if you are comfortable doing so for the sites concerned.
 
 Known gaps: Taleo and SuccessFactors boards are reported as `unsupported_ats`;
 companies with no detected board are `no_ats`. Niche university systems (Peopleclick,
@@ -273,7 +284,7 @@ One command checks that everything is installed and working:
    |---|---|
    | `test_classify.py` | US location parsing, education, career level, experience, state inference |
    | `test_job_details.py` | salary, work arrangement, term, shifts, travel, visa, relocation, certifications |
-   | `test_find_careers.py` | input types, CSV loading, saved-sites file, manual-check notes |
+   | `test_find_careers.py` | input types, CSV loading, saved-sites file, manual-check notes, robots.txt and unreachable-careers-page messages (homepage never tried instead) |
    | `test_pipeline.py` | link scoring, job-board detection and links, refusal detection, location / schema.org helpers, and a full offline run (fake job board → classification → CSVs → database) |
    | `test_database.py` | creating and adding to the database, closing jobs, schema upgrades; builds `tests/fixture.db` |
 

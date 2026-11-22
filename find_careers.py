@@ -217,6 +217,23 @@ class Result:
     notes: str = ""
 
 
+PASTE_HINT = "paste it into careers_url in the input (or listings_url in known_sites.csv)"
+
+
+def robots_note(url: str) -> str:
+    """manual_check for a page or job board whose robots.txt disallows us: skipped, not collected."""
+    host = urlparse(url if "//" in url else "https://" + url).netloc or url
+    return (f"skipped: robots.txt on {host} asks scripts not to read {url} - open the company's careers search "
+            f"page in a browser and try again with that careers search URL; {PASTE_HINT}")
+
+
+def careers_failed_note(url: str) -> str:
+    """manual_check for a careers page (given in the input or saved) that could not be loaded.
+    The homepage is deliberately not tried instead: the user gave this page for a reason."""
+    return (f"the careers page {url} could not be loaded - please manually check for the careers page URL or "
+            f"job search URL and try again; {PASTE_HINT}")
+
+
 def manual_check_note(r: Result) -> str:
     """Tell the user which page to open by hand, and where to put what they find."""
     paste = "paste the job listings URL into listings_url in known_sites.csv (or careers_url in the input)"
@@ -660,6 +677,8 @@ class SiteScanner:
         self.robots_errors: dict[str, int] = {}  # host -> 5xx status its robots.txt returned
         self.rejections: dict[str, str] = {}  # "host status vendor" -> first URL refused
         self.requests = 0                     # HTTP requests this company cost
+        self.robots_skipped = ""              # first page robots.txt kept us from (not guessed addresses)
+        self.careers_failed = ""              # careers page that wouldn't load, nor its search pages
         self.base_domain = ""
         self.home_key = ""
 
@@ -713,6 +732,7 @@ class SiteScanner:
         if not self.allowed(url):
             if record_rejection:  # stay quiet about guessed addresses
                 p = urlparse(url)
+                self.robots_skipped = self.robots_skipped or url
                 err = self.robots_errors.get(f"{p.scheme}://{p.netloc}")
                 self.notes.append(f"robots.txt on {p.netloc} unavailable (server error {err}) - treated as "
                                   f"disallowed, retry later" if err else f"robots.txt disallows {url}")
@@ -1061,6 +1081,13 @@ class SiteScanner:
         self.result.notes = "; ".join(dict.fromkeys(self.notes))
         self.result.requests = self.requests
         self.result.manual_check = manual_check_note(self.result)
+        if self.result.status in ("blocked", "error"):
+            # the site couldn't be loaded: say why, and what to paste in. robots.txt first, since
+            # retrying the same page won't help (not_found keeps its own "search for it" note)
+            if self.robots_skipped:
+                self.result.manual_check = robots_note(self.robots_skipped)
+            elif self.careers_failed:
+                self.result.manual_check = careers_failed_note(self.careers_failed)
         return self.result
 
     def _scan(self) -> None:
@@ -1121,8 +1148,9 @@ class SiteScanner:
             page = self.try_search_pages(f"{p.scheme}://{p.netloc}", skip=url)
             if page is None:
                 res.status = "blocked" if self.rejections else "error"
+                self.careers_failed = url
                 self.notes.append(f"careers page unreachable (status {status}), and none of its usual "
-                                  f"search pages loaded")
+                                  f"search pages loaded - the homepage is not tried instead")
                 return  # scan() still tries the usual job-board addresses for the domain
             self.notes.append(f"careers page unreachable (status {status}) - used its search page {page.url}")
         res.final_url = page.url
