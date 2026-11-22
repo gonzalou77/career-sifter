@@ -175,7 +175,9 @@ be installed, since SQLite is built into Python. `--db other.db` picks another f
 
 **See [DATABASE.md](DATABASE.md)** for a step-by-step tutorial: installing Python if
 needed, creating and growing the database, tools for looking at it (DB Browser for
-SQLite, the `sqlite3` command line, pandas), example queries, and what each table holds.
+SQLite, the `sqlite3` command line, pandas), example queries, what each table holds,
+analysing it from **R** (DBI/RSQLite, dplyr, ggplot2), and inspecting it with **Docker**
+(sqlite-web, Datasette, sqlite3 in a container).
 
 ### Details pulled from each posting (`job_details.py`)
 

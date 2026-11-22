@@ -91,7 +91,8 @@ so it isn't uploaded to GitHub.
 
 ## 4. Look at the database (optional tools)
 
-Pick one.
+Pick one. For R see [section 7](#7-using-the-database-from-r). To avoid installing
+anything except Docker, see [section 8](#8-inspecting-the-database-with-docker).
 
 ### Option A: DB Browser for SQLite (point-and-click, easiest)
 
@@ -229,6 +230,220 @@ Multi-value fields (states, degrees, certifications, keywords) are also stored a
 
 When the scripts gain new job columns, an existing database is upgraded automatically
 the next time `fetch_jobs.py` runs. Nothing needs to be recreated.
+
+## 7. Using the database from R
+
+R reads the database directly with the **DBI** and **RSQLite** packages; no other
+database software is needed. (Tested with R 4.6.)
+
+### 7.1 Install R (and optionally RStudio)
+
+Check first. In PowerShell or Terminal:
+
+```powershell
+Rscript --version
+```
+
+If that isn't recognised:
+
+- **Windows:**
+  ```powershell
+  winget install --id RProject.R -e
+  winget install --id Posit.RStudio -e      # optional: the RStudio editor
+  ```
+  or download R from https://cran.r-project.org/ and RStudio from https://posit.co/download/rstudio-desktop/.
+  Close and reopen PowerShell afterwards. If `Rscript` is still not recognised, call it by
+  its full path, e.g. `& "C:\Program Files\R\R-4.6.1\bin\Rscript.exe"`. RStudio finds R by
+  itself either way.
+- **macOS:** `brew install --cask r` and, optionally, `brew install --cask rstudio`.
+- **Linux (Debian/Ubuntu):** `sudo apt install r-base`.
+
+### 7.2 Install the packages (once)
+
+In the R console (RStudio's Console pane, or `R` in a terminal):
+
+```r
+install.packages(c("DBI", "RSQLite"))               # needed
+install.packages(c("dplyr", "dbplyr", "ggplot2"))   # optional: tidy queries and plots
+```
+
+### 7.3 Connect and run SQL
+
+Point R at the project folder first: in RStudio use **Session → Set Working Directory →
+Choose Directory…** and pick the `career sifter` folder, or run
+`setwd("C:/Users/<you>/.../career sifter")` (forward slashes). Alternatively, give the
+full path to the database in `dbConnect`.
+
+```r
+library(DBI)
+
+con <- dbConnect(RSQLite::SQLite(), "career_sifter.db")
+dbListTables(con)                  # the tables and views from section 6
+dbListFields(con, "jobs")          # the columns of a table
+
+open_by_company <- dbGetQuery(con, "
+  SELECT company_key, COUNT(*) AS open_jobs
+  FROM v_open_jobs
+  GROUP BY company_key
+  ORDER BY open_jobs DESC")
+open_by_company
+
+# values go in with ? placeholders and params = list(...)
+lilly <- dbGetQuery(con, "
+  SELECT title, salary_min, salary_max, url
+  FROM v_open_jobs
+  WHERE company_key = ? AND salary_min IS NOT NULL",
+  params = list("lilly.com"))
+```
+
+Any query from section 5 works inside `dbGetQuery(con, "...")`.
+
+### 7.4 Work with a whole table as a data frame
+
+```r
+jobs <- dbReadTable(con, "v_open_jobs")     # every open job, every column
+dim(jobs)
+aggregate(salary_annual_mid ~ career_level, data = jobs, FUN = median)
+
+# dates are stored as text: convert when you need them
+jobs$first_seen <- as.Date(substr(jobs$first_seen_at, 1, 10))
+table(jobs$first_seen)
+```
+
+`is_open`, `is_us` and `remote` are stored as 1/0; empty values come back as `NA`.
+
+### 7.5 dplyr: write R, run as SQL
+
+With **dbplyr**, dplyr code runs inside the database and only the result is pulled into R
+with `collect()`. This is handy once the database gets large.
+
+```r
+library(dplyr)
+library(dbplyr)
+
+open_jobs <- tbl(con, "v_open_jobs")
+
+pay_by_level <- open_jobs |>
+  filter(!is.na(salary_annual_mid)) |>
+  group_by(career_level) |>
+  summarise(jobs = n(), avg_pay = mean(salary_annual_mid, na.rm = TRUE)) |>
+  arrange(avg_pay) |>
+  collect()
+
+# multi-value fields: join the one-row-per-value table
+top_states <- tbl(con, "job_states") |>
+  inner_join(open_jobs, by = "job_uid") |>
+  count(state, sort = TRUE) |>
+  head(10) |>
+  collect()
+```
+
+(`show_query()` in place of `collect()` prints the SQL that dplyr wrote.)
+
+### 7.6 A plot and a CSV
+
+```r
+library(ggplot2)
+
+pay <- open_jobs |>
+  filter(!is.na(salary_annual_mid)) |>
+  select(company_key, career_level, salary_annual_mid) |>
+  collect()
+pay$career_level <- factor(pay$career_level,
+                           levels = c("early", "mid", "senior", "executive", "unspecified"))
+
+ggplot(pay, aes(x = career_level, y = salary_annual_mid)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(x = "Career level", y = "Annual pay (midpoint)", title = "Pay by career level, open US jobs")
+ggsave("pay_by_level.png", width = 7, height = 4)
+
+write.csv(open_by_company, "open_by_company.csv", row.names = FALSE)
+```
+
+### 7.7 Disconnect when done
+
+```r
+dbDisconnect(con)
+```
+
+Reading from R while nothing else is writing is always safe. Disconnect before running
+`fetch_jobs.py` if R is in the middle of a long query.
+
+To rerun an analysis without RStudio, save the code as e.g. `analysis.R` and run
+`Rscript analysis.R` from the project folder.
+
+## 8. Inspecting the database with Docker
+
+If you'd rather not install database tools on your computer, Docker can run them in a
+throw-away container that opens your `career_sifter.db`. Nothing is installed except
+Docker itself, and the container is removed when you stop it (`--rm`).
+
+> These commands use public images (`coleifer/sqlite-web`, `datasetteproject/datasette`,
+> `alpine`). They weren't run on the development machine, which has no Docker. If an
+> image's defaults have changed, see its page on Docker Hub.
+
+### 8.1 Install Docker
+
+- **Windows:** `winget install --id Docker.DockerDesktop -e`, or download Docker Desktop
+  from https://www.docker.com/products/docker-desktop/. Start Docker Desktop and wait until
+  it says it's running. It may ask to enable WSL 2 and restart.
+- **macOS:** `brew install --cask docker`, then open Docker from Applications.
+- **Linux:** follow https://docs.docker.com/engine/install/ for your distribution.
+
+Check it works:
+
+```powershell
+docker run --rm hello-world
+```
+
+### 8.2 Run the commands from the project folder
+
+All commands below share the current folder with the container (`-v "${PWD}:/data"`).
+`cd` into the `career sifter` folder first. Keep the quotes: the folder name has a space.
+
+| Shell | Current-folder syntax |
+|---|---|
+| PowerShell (Windows) | `"${PWD}:/data"` (as written below) |
+| macOS / Linux / Git Bash | `"$(pwd):/data"` |
+
+### 8.3 Option 1: sqlite-web (browse and query in your web browser)
+
+```powershell
+docker run -it --rm -p 8080:8080 -v "${PWD}:/data" -e SQLITE_DATABASE=career_sifter.db coleifer/sqlite-web
+```
+
+Open http://localhost:8080. You can browse each table, see its structure, run SQL (the
+**Query** tab) and export results. Stop it with **Ctrl+C** in the terminal.
+
+### 8.4 Option 2: Datasette (explore, facet, export to CSV/JSON)
+
+```powershell
+docker run --rm -p 8001:8001 -v "${PWD}:/data" datasetteproject/datasette datasette -p 8001 -h 0.0.0.0 /data/career_sifter.db
+```
+
+Open http://localhost:8001. Datasette is built for exploring data: filter columns, facet
+by `company_key`, `career_level` or `state`, run SQL, and download any result as CSV or
+JSON. It doesn't change the database.
+
+### 8.5 Option 3: the sqlite3 command line, inside a container
+
+```powershell
+docker run --rm -it -v "${PWD}:/data" -w /data alpine sh -c "apk add --no-cache sqlite && sqlite3 career_sifter.db"
+```
+
+This gives you the `sqlite>` prompt from section 4, option B (`.tables`,
+`.headers on`, `.mode column`, queries, `.quit`), without installing sqlite3 on your
+computer.
+
+### Notes
+
+- Don't run `fetch_jobs.py` while a container has the database open for writing. Browsing
+  and queries are fine.
+- On Windows, if the container can't see your files, open Docker Desktop → **Settings →
+  Resources → File sharing** and make sure the drive or folder is shared.
+- Port already in use? Change the first number, e.g. `-p 8090:8080`, and open
+  http://localhost:8090.
 
 ## Troubleshooting
 
