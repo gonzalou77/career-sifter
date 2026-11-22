@@ -373,6 +373,28 @@ Reading from R while nothing else is writing is always safe. Disconnect before r
 To rerun an analysis without RStudio, save the code as e.g. `analysis.R` and run
 `Rscript analysis.R` from the project folder.
 
+### 7.8 Test the database from R
+
+The project includes a **testthat** test suite for everything in this section. Run it
+after installing the packages (`install.packages(c("testthat", "DBI", "RSQLite",
+"dplyr", "dbplyr", "ggplot2"))`):
+
+```powershell
+Rscript tests/run_r_tests.R career_sifter.db    # your database
+Rscript tests/run_r_tests.R                     # the known-contents test database
+```
+
+Pointed at your database, it checks:
+- the tables are there;
+- data quality: each job appears once, salary minimum ≤ maximum, consistent open/closed dates, every open job has a link, valid state codes;
+- every query in this tutorial runs;
+- dplyr agrees with SQL;
+- the chart builds.
+
+It ends with `all R database checks passed`. The known-contents database
+(`tests/fixture.db`) is built by `python test.py`, and tests exact answers too. See the
+README's *Testing* section.
+
 ## 8. Inspecting the database with Docker
 
 If you'd rather not install database tools on your computer, Docker can run them in a

@@ -1,5 +1,18 @@
+# Career Sifter - Python 3.10 or newer.
+# Install:  python -m pip install -r requirements.txt
+# Check:    python test.py
+# SQLite (the database) is built into Python: nothing to install.
+
 requests>=2.31
 beautifulsoup4>=4.12
-# Optional: only needed for --render (JS-heavy sites). After installing run:
-#   python -m playwright install chromium
+urllib3>=1.26,<3        # imported directly for retry settings (Retry(allowed_methods=...) needs 1.26+)
+
+# Optional: only needed for find_careers.py --render (JavaScript-heavy sites).
+# After installing it, also run:  python -m playwright install chromium
 # playwright>=1.44
+
+# Optional: pandas, for the Python analysis example in DATABASE.md (section 4, option C).
+# pandas>=2.0
+
+# R is separate (not pip). For the R tutorial and tests, in R:
+#   install.packages(c("DBI", "RSQLite", "dplyr", "dbplyr", "ggplot2", "testthat"))

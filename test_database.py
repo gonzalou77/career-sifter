@@ -78,8 +78,70 @@ def test_schema_upgrade():
         assert {"certifications", "salary_annual_mid", "work_arrangement", "is_open", "first_seen_run"} <= cols
 
 
+# --------------------------------------------------------------------------- #
+# Known-contents database for the R tests (tests/testthat/test-database.R).
+# Two complete runs; the R tests check exact answers against these values.
+# --------------------------------------------------------------------------- #
+
+FIXTURE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixture.db")
+
+
+def fixture_job(company, job_id, title, level, states, education, low=None, high=None, period="year",
+                url=True):
+    j = Job(company=company, ats="Workday", job_id=job_id, title=title, is_us=True, states=list(states),
+            career_level=level, education_mentioned=list(education),
+            min_education=education[0] if education else "Not stated",
+            url=f"https://example.com/{company.lower()}/{job_id}" if url else "")
+    if low is not None:
+        per_year = 2080 if period == "hour" else 1
+        j.salary_min, j.salary_max, j.salary_currency, j.salary_period = low, high, "USD", period
+        j.salary_annual_mid, j.salary_source = (low + high) / 2 * per_year, "description"
+    return j
+
+
+def fixture_reports(run):
+    lilly = [fixture_job("Lilly", "R1", "Scientist I" if run == 1 else "Scientist II", "early" if run == 1 else "mid",
+                         ["IN"], ["Bachelor's"], 80000 if run == 1 else 85000, 100000 if run == 1 else 105000),
+             fixture_job("Lilly", "R2", "Associate Director", "senior", ["IN", "NJ"], ["PhD"], 150000, 200000)]
+    if run == 1:
+        lilly.append(fixture_job("Lilly", "R3", "Data Analyst Intern", "early", ["CA"], ["Bachelor's"],
+                                 25, 30, "hour"))   # gone in run 2 -> closed
+    else:
+        lilly.append(fixture_job("Lilly", "R4", "Senior Engineer", "senior", ["TX"], ["Bachelor's"],
+                                 120000, 140000))   # new in run 2
+    pfizer = [fixture_job("Pfizer", "P1", "Principal Scientist", "senior", ["NY"], ["PhD"]),
+              fixture_job("Pfizer", "P2", "Vice President, Research", "executive", ["NY"], ["PhD"], 300000, 400000)]
+    return [CompanyReport(company="Lilly", ats="Workday", board_url="https://lilly.example/board", status="ok",
+                          total_openings=640 + run, us_openings=len(lilly), jobs=lilly, company_key="lilly.com"),
+            CompanyReport(company="Pfizer", ats="Workday", board_url="https://pfizer.example/board", status="ok",
+                          total_openings=700, us_openings=len(pfizer), jobs=pfizer, company_key="pfizer.com")]
+
+
+def build_fixture(path=FIXTURE_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        os.remove(path)
+    for run_no in (1, 2):
+        conn = database.open_db(path)
+        run_id = database.start_run(conn, "fixture", {}, complete=True, us_only=True)
+        database.save_run(conn, run_id, fixture_reports(run_no), complete=True, us_only=True)
+        conn.close()
+    return path
+
+
+def test_build_fixture():
+    """Builds tests/fixture.db for the R tests and checks the values they rely on."""
+    path = build_fixture()
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT COUNT(*), SUM(is_open) FROM jobs").fetchone() == (6, 5)
+    assert conn.execute("SELECT is_open FROM jobs WHERE job_id = 'R3'").fetchone() == (0,)
+    assert conn.execute("SELECT first_seen_run FROM jobs WHERE job_id = 'R4'").fetchone() == (2,)
+    conn.close()
+
+
 if __name__ == "__main__":
     test_create_then_add()
     test_failed_company_closes_nothing()
     test_schema_upgrade()
+    test_build_fixture()
     print("all database checks passed")

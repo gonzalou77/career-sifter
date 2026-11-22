@@ -3,6 +3,10 @@
 Finds the careers / job-listings page for a list of company websites
 (pharma, biotech, ag, diagnostics, computational science, ...).
 
+- **[ARCHITECTURE.md](ARCHITECTURE.md):** Mermaid diagrams (system overview, entry paths
+  and workarounds, per-company collection, classes, database tables, tests).
+- **[DATABASE.md](DATABASE.md):** the SQL database tutorial (Python, R, Docker).
+
 ## Setup
 
 ```powershell
@@ -16,6 +20,14 @@ Optional, for JavaScript-heavy sites:
 .\.venv\Scripts\python -m pip install playwright
 .\.venv\Scripts\python -m playwright install chromium
 ```
+
+Then check that everything is installed and working:
+
+```powershell
+.\.venv\Scripts\python test.py
+```
+
+It should end with `Everything is installed and working.` (See [Testing](#testing).)
 
 ## Usage
 
@@ -240,3 +252,70 @@ companies with no detected board are `no_ats`. Niche university systems (Peoplec
 Clinch, Paradox, custom portals) are not supported. Some Workday boards
 list bare site names ("Lincoln") with no state, so those jobs show under
 `(not given)` with the site name as city.
+
+## Testing
+
+### Python: `test.py`
+
+One command checks that everything is installed and working:
+
+```powershell
+.\.venv\Scripts\python test.py
+```
+
+1. **Installation:** Python version, every package in `requirements.txt`, Playwright
+   (optional, only for `--render`), Python's built-in SQLite (version, and a real
+   insert-or-update), all six project modules import, and the folder is writable.
+2. **Tests:** runs every `test_*.py` file and reports each test as ok / FAIL:
+
+   | File | Covers |
+   |---|---|
+   | `test_classify.py` | US location parsing, education, career level, experience, state inference |
+   | `test_job_details.py` | salary, work arrangement, term, shifts, travel, visa, relocation, certifications |
+   | `test_find_careers.py` | input types, CSV loading, saved-sites file, manual-check notes |
+   | `test_pipeline.py` | link scoring, job-board detection and links, refusal detection, location / schema.org helpers, and a full offline run (fake job board → classification → CSVs → database) |
+   | `test_database.py` | creating and adding to the database, closing jobs, schema upgrades; builds `tests/fixture.db` |
+
+The offline tests need no internet and take a few seconds. It ends with
+`Everything is installed and working.` and exits with code 0, or lists what failed and
+exits with 1.
+
+| Option | Adds |
+|---|---|
+| `--live` | a real run of both scripts on one company (benchling.com, 3 jobs); needs internet |
+| `--r` | the R tests below (needs R and its packages) |
+| `-k text` | only tests whose name contains `text`, e.g. `-k salary` |
+
+Each `test_*.py` file also runs on its own, e.g. `python test_job_details.py`. A new
+`test_*.py` file is picked up by `test.py` automatically.
+
+### R: `tests/run_r_tests.R`
+
+Tests for working with the database from R (DATABASE.md section 7), written with
+**testthat**. Install the packages once, in R:
+
+```r
+install.packages(c("testthat", "DBI", "RSQLite", "dplyr", "dbplyr", "ggplot2"))
+```
+
+Then, from the project folder:
+
+```powershell
+Rscript tests/run_r_tests.R                     # against tests/fixture.db (run python test.py first)
+Rscript tests/run_r_tests.R career_sifter.db    # against your real database
+```
+
+(`python test.py --r` does the first one for you. If `Rscript` isn't on PATH, use its
+full path, e.g. `& "C:\Program Files\R\R-4.6.1\bin\Rscript.exe"`.)
+
+- **Any database:**
+  - the expected tables and views exist;
+  - data quality: each job appears once, salary minimum ≤ maximum, valid pay periods, consistent open/closed dates, open jobs have a link, valid US state codes, no orphaned rows, documented career levels;
+  - every tutorial query runs;
+  - tables load as data frames with dates that convert;
+  - dplyr matches SQL;
+  - the tutorial's ggplot chart builds.
+- **`tests/fixture.db` only:** exact answers on known contents. These include open jobs per company, top states, average pay by level, education counts, a job closed between runs, and a job updated across runs keeping its first-seen date. They're skipped on other databases.
+
+`tests/fixture.db` is built by `python test.py` (from `test_database.py`) and is
+git-ignored like other databases.

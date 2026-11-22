@@ -347,6 +347,13 @@ def ats_board_url(url: str) -> str:
     return url
 
 
+def is_excluded_host(host: str) -> bool:
+    """Social / job-aggregator site? Compared on the whole registered domain, so "x.com" (X/Twitter)
+    doesn't also exclude careers.idexx.com or spacex.com."""
+    rd = registered_domain(host)
+    return any(rd == h or (h.endswith(".") and rd.startswith(h)) for h in EXCLUDED_HOSTS)
+
+
 def board_company_name(board_url: str) -> str:
     """Best guess at the company from a job-board URL: 'benchling' from jobs.ashbyhq.com/benchling,
     'pfizer' from pfizer.wd1.myworkdayjobs.com, 'werfen' from careers-werfen.icims.com."""
@@ -363,7 +370,7 @@ def score_link(text: str, url: str, base_domain: str, phrases: dict[str, int]) -
     p = urlparse(url)
     host = (p.hostname or "").lower()
     path = unquote(p.path).lower()
-    if any(h in host for h in EXCLUDED_HOSTS) or path.endswith(SKIP_EXTENSIONS):
+    if is_excluded_host(host) or path.endswith(SKIP_EXTENSIONS):
         return -100
 
     score = 0
