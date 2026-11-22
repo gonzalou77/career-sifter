@@ -31,6 +31,7 @@ from dataclasses import asdict, dataclass, field
 from statistics import median
 from urllib.parse import urlparse
 
+import database
 from ats_clients import CLIENTS, Job, RobotsDisallowed
 from classify import (EDU_NOT_STATED, EDU_ORDER, LEVEL_UNSPECIFIED, LEVELS, classify_education,
                       classify_level, infer_missing_states, min_years_experience)
@@ -57,6 +58,7 @@ class CompanyReport:
     jobs: list[Job] = field(default_factory=list)   # US jobs (or all, with --all-locations)
     notes: list[str] = field(default_factory=list)
     manual_check: str = ""  # what to open by hand when the openings couldn't be collected
+    company_key: str = ""   # registered domain (pfizer.com): the company's id in the database
 
 
 def load_keywords(spec: str | None) -> list[str]:
@@ -97,7 +99,7 @@ def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pa
     company = row.get("company") or domain
     ats = row.get("ats", "")
     board = row.get("listings_url") or row.get("careers_url", "")
-    rep = CompanyReport(company=company, ats=ats, board_url=board)
+    rep = CompanyReport(company=company, ats=ats, board_url=board, company_key=domain or company.lower())
     finder_rejections = row.get("rejected_requests", "")
 
     if row.get("status") not in USABLE_STATUSES:  # blocked / not_found / error in find_careers
@@ -297,6 +299,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-jobs", type=int, default=0, help="cap jobs per company (for quick tests)")
     ap.add_argument("--ignore-robots", action="store_true",
                     help="collect from job boards even when their robots.txt disallows scripts")
+    ap.add_argument("--db", default="career_sifter.db",
+                    help="SQLite database to create or add to (default career_sifter.db)")
+    ap.add_argument("--no-db", action="store_true", help="don't write to the database (CSV/JSONL only)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -329,6 +334,20 @@ def main(argv: list[str] | None = None) -> int:
 
     write_outputs(reports, keywords, args.out)
     log.info("\nWrote summary.csv, us_locations.csv, jobs.csv, jobs.jsonl to %s/", args.out)
+
+    if not args.no_db:
+        created = not os.path.exists(args.db)
+        complete, us_only = not args.max_jobs, not args.all_locations
+        settings = {k: v for k, v in vars(args).items() if k not in ("db", "no_db", "verbose")}
+        conn = database.open_db(args.db)
+        try:
+            run_id = database.start_run(conn, args.input, settings, complete, us_only)
+            s = database.save_run(conn, run_id, reports, complete, us_only)
+        finally:
+            conn.close()
+        log.info("%s database %s (run %d): %d new jobs, %d updated, %d closed%s; %d jobs in total, %d open",
+                 "Created" if created else "Added to", args.db, run_id, s["new"], s["updated"], s["closed"],
+                 "" if complete else " (capped run: none marked closed)", s["total_jobs"], s["open_jobs"])
     return 0
 
 

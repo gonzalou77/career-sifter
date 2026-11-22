@@ -6,3 +6,5 @@ __pycache__/
 output/
 # saved careers pages / job boards (your own working data)
 known_sites.csv
+# the jobs database (your own data; can grow large)
+*.db

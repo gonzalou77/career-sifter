@@ -165,6 +165,18 @@ Output (in `output/`):
 | `jobs.csv` | one row per US job with all tags, details and its URL |
 | `jobs.jsonl` | the same jobs including full description text |
 
+### SQL database
+
+Every run also saves the jobs into a SQLite database, `career_sifter.db`. It's created on
+the first run and added to on every later run: new jobs are inserted, existing ones
+updated, and jobs a complete run no longer sees are marked closed. Nothing extra needs to
+be installed, since SQLite is built into Python. `--db other.db` picks another file and
+`--no-db` skips it.
+
+**See [DATABASE.md](DATABASE.md)** for a step-by-step tutorial: installing Python if
+needed, creating and growing the database, tools for looking at it (DB Browser for
+SQLite, the `sqlite3` command line, pandas), example queries, and what each table holds.
+
 ### Details pulled from each posting (`job_details.py`)
 
 Taken from the job board's own fields when it has them (Ashby/Lever pay, schema.org
