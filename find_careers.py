@@ -23,10 +23,12 @@ import argparse
 import csv
 import gzip
 import logging
+import os
 import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from urllib import robotparser
@@ -190,6 +192,8 @@ class PageSignals:
 class Result:
     input_url: str
     company: str = ""
+    input_type: str = ""        # homepage | careers_page | job_board: which entry path the scan took
+    source: str = ""            # known (saved URL reused) | discovered | rediscovered (saved URL failed)
     status: str = "not_found"   # listings_found | careers_page_found | not_found | blocked | error
     rejected_requests: str = ""  # hosts that refused us, e.g. "www.x.com 403 Cloudflare"
     careers_url: str = ""
@@ -306,8 +310,8 @@ def ats_board_url(url: str) -> str:
         return root + segs[0]
     if host.endswith(".icims.com"):
         return f"{p.scheme}://{p.netloc}/jobs/search?ss=1"
-    if (m := re.match(r"^/([a-z]{2}(?:-[a-z]{2})?)/job/[^/]*-jid-\d+", p.path, re.I)):
-        return f"{root}{m.group(1)}/jobs"  # Attrax single-job link -> the site's job search
+    if (m := re.match(r"^/([a-z]{2}(?:-[a-z]{2})?)/(?:job/[^/]*-jid-\d+|jobs(?:/|$))", p.path, re.I)):
+        return f"{root}{m.group(1)}/jobs"  # Attrax job link or filtered search -> the site's job search
     if "myworkdayjobs.com" in host or "myworkdaysite.com" in host:
         # /en-US/SiteName/job/... -> /SiteName ; skip an optional locale segment
         site = segs[1] if re.fullmatch(r"[a-z]{2}(-[A-Za-z]{2})?", segs[0]) and len(segs) > 1 else segs[0]
@@ -351,7 +355,9 @@ def score_link(text: str, url: str, base_domain: str, phrases: dict[str, int]) -
         score -= 3
 
     segs = [s.split(".")[0] for s in path.split("/") if s]
-    seg_hits = [PATH_TOKENS[s] for s in segs if s in PATH_TOKENS]
+    if segs and re.fullmatch(r"[a-z]{2}(?:[-_][a-z]{2})?", segs[0]) and segs[0][:2] not in ("en", "us"):
+        score -= 2  # same page in another language (/ko/careers, /de-de/karriere): prefer English
+    seg_hits =[PATH_TOKENS[s] for s in segs if s in PATH_TOKENS]
     seg_hits += [6 for s in segs if s.startswith("career") and s not in PATH_TOKENS]
     if seg_hits:
         score += max(seg_hits)
@@ -437,13 +443,33 @@ def analyze_page(page: Page) -> PageSignals:
     return sig
 
 
-def load_sites(path: str) -> list[tuple[str, str]]:
-    """Return [(url, company_name)]. Accepts .txt or .csv.
+def classify_input(url: str) -> str:
+    """Decide where a scan should start: 'job_board', 'careers_page' or 'homepage'.
 
-    .txt: one entry per line, either a URL or "Company Name, URL". URLs can be a homepage,
-    a careers page, or the job board itself.
+    careers_page: a careers subdomain (careers.x.com, jobs.x.edu) or a careers-like path
+    (/careers, /jobs, /join-us, ...), or a company-domain career site platform (Phenom, Attrax).
     """
-    sites: list[tuple[str, str]] = []
+    p = urlparse(url if "//" in url else "https://" + url)
+    ats = detect_ats((p.netloc + p.path).lower())
+    if ats:
+        return "careers_page" if ats in SAME_DOMAIN_ATS else "job_board"
+    if (p.hostname or "").split(".")[0].lower() in CAREER_SUBDOMAINS | {"employment"}:
+        return "careers_page"
+    segs = [s.lower().split(".")[0] for s in p.path.split("/") if s]
+    if any(PATH_TOKENS.get(s, 0) >= 4 or s.startswith("career") for s in segs):
+        return "careers_page"
+    return "homepage"
+
+
+def load_sites(path: str) -> list[tuple[str, str, str]]:
+    """Return [(url, company_name, careers_url)]. Accepts .txt or .csv.
+
+    .txt: one entry per line, either a URL or "Company Name, URL". The URL can be a homepage,
+    a careers page or the job board itself; the type is detected from the URL.
+    .csv: a url/website column, optional company column, and an optional careers_url column.
+    A filled careers_url makes that row start from the careers page and skip the homepage.
+    """
+    sites: list[tuple[str, str, str]] = []
     if path.lower().endswith(".csv"):
         with open(path, newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
@@ -451,10 +477,13 @@ def load_sites(path: str) -> list[tuple[str, str]]:
             url_col = next((cols[c] for c in ("url", "website", "site", "domain", "homepage") if c in cols),
                            (reader.fieldnames or [None])[0])
             name_col = next((cols[c] for c in ("company", "name", "organization") if c in cols), None)
+            careers_col = next((cols[c] for c in ("careers_url", "careers", "careers_page", "jobs_url") if c in cols),
+                               None)
             for row in reader:
                 url = (row.get(url_col) or "").strip()
-                if url:
-                    sites.append((url, (row.get(name_col) or "").strip() if name_col else ""))
+                careers = (row.get(careers_col) or "").strip() if careers_col else ""
+                if url or careers:
+                    sites.append((url or careers, (row.get(name_col) or "").strip() if name_col else "", careers))
     else:
         with open(path, encoding="utf-8-sig") as f:
             for line in f:
@@ -463,10 +492,39 @@ def load_sites(path: str) -> list[tuple[str, str]]:
                     continue
                 name, sep, url = line.rpartition(",")
                 if sep and " " not in url.strip() and "." in url:
-                    sites.append((url.strip(), name.strip()))
+                    sites.append((url.strip(), name.strip(), ""))
                 else:
-                    sites.append((line, ""))
+                    sites.append((line, "", ""))
     return sites
+
+
+KNOWN_FIELDS = ["key", "company", "input_url", "careers_url", "listings_url", "ats", "method", "last_verified"]
+GOOD_STATUSES = ("listings_found", "careers_page_found")
+
+
+def site_key(url: str) -> str:
+    """Key a company by its registered domain, so pfizer.com, www.pfizer.com and
+    careers.pfizer.com share one saved entry. A pasted job board is keyed by the board."""
+    full = url if "//" in url else "https://" + url
+    if classify_input(full) == "job_board":
+        return "board:" + url_key(ats_board_url(full))
+    return registered_domain(urlparse(full).hostname)
+
+
+def load_known(path: str) -> dict[str, dict]:
+    """Saved careers pages / job boards from earlier runs, keyed by site_key()."""
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return {row["key"]: row for row in csv.DictReader(f) if row.get("key")}
+
+
+def save_known(path: str, known: dict[str, dict]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=KNOWN_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for key in sorted(known):
+            w.writerow(known[key])
 
 
 REJECT_STATUSES = {202, 401, 403, 405, 406, 429, 451, 503}
@@ -528,13 +586,17 @@ def make_session() -> requests.Session:
 # --------------------------------------------------------------------------- #
 
 class SiteScanner:
-    def __init__(self, input_url: str, company: str, args: argparse.Namespace):
+    def __init__(self, input_url: str, company: str, args: argparse.Namespace, careers_url: str = "",
+                 known: dict | None = None):
         self.args = args
         self.session = make_session()
         self.result = Result(input_url=input_url, company=company)
+        self.careers_url = careers_url  # given in the input: start here, skip the homepage
+        self.known = known              # saved entry from known_sites.csv, if any
         self.notes: list[str] = []
         self.cache: dict[str, Page | None] = {}
         self.robots: dict[str, robotparser.RobotFileParser | None] = {}
+        self.robots_errors: dict[str, int] = {}  # host -> 5xx status its robots.txt returned
         self.rejections: dict[str, str] = {}  # "host status vendor" -> first URL refused
         self.base_domain = ""
         self.home_key = ""
@@ -560,6 +622,7 @@ class SiteScanner:
                     rp.parse(r.text.splitlines())
                 elif r.status_code >= 500:  # RFC 9309: server error -> assume disallow all
                     rp.disallow_all = True
+                    self.robots_errors[host] = r.status_code
                 else:                       # 4xx / missing -> allow all
                     rp.allow_all = True
             except requests.RequestException:
@@ -576,7 +639,10 @@ class SiteScanner:
     def get(self, url: str, record_rejection: bool = True) -> requests.Response | None:
         if not self.allowed(url):
             if record_rejection:  # stay quiet about guessed addresses
-                self.notes.append(f"robots.txt disallows {url}")
+                p = urlparse(url)
+                err = self.robots_errors.get(f"{p.scheme}://{p.netloc}")
+                self.notes.append(f"robots.txt on {p.netloc} unavailable (server error {err}) - treated as "
+                                  f"disallowed, retry later" if err else f"robots.txt disallows {url}")
             return None
         time.sleep(self.args.delay)
         try:
@@ -653,13 +719,13 @@ class SiteScanner:
             if page and page.ok:
                 return page
             last = page
-        if self.rejections:
-            # homepage refused us: careers sites are often separate and unprotected
+        if not p.path.strip("/"):
+            # homepage unusable (refused, robots.txt, down): careers sites are often separate hosts
             bare = host[4:] if host.startswith("www.") else host
             for sub in ("careers", "jobs"):
                 page = self.fetch(f"https://{sub}.{bare}/")
                 if page and page.ok:
-                    self.notes.append(f"homepage blocked - started from {sub}.{bare}")
+                    self.notes.append(f"homepage unusable - started from {sub}.{bare}")
                     return page
         if self.args.render:
             page = self.render(raw)
@@ -668,25 +734,23 @@ class SiteScanner:
         self.notes.append(f"homepage unreachable (status {last.status if last else 'no response'})")
         return None
 
-    def input_is_board(self) -> bool:
-        """If the input URL is already a known job board (e.g. a Workday or Ashby link pasted in
-        because the company homepage blocks us), use it directly instead of crawling it."""
-        raw = self.result.input_url.strip()
-        url = raw if re.match(r"^https?://", raw, re.I) else "https://" + raw
-        p = urlparse(url)
-        ats = detect_ats(p.netloc + p.path)
-        if not ats or ats in SAME_DOMAIN_ATS:
-            return False
+    def use_board(self, url: str) -> None:
+        """The input is already a known job board (e.g. a Workday or Ashby link pasted in because
+        the company homepage blocks us): use it directly instead of crawling it."""
+        ats = detect_ats(urlparse(url).netloc + urlparse(url).path)
         board = ats_board_url(url)
         page = self.fetch(board)  # only to record a refusal, if any; fetch_jobs uses the API anyway
         self.result.final_url = page.url if page else ""
+        if page is not None and page.status in (404, 410):  # board no longer exists
+            self.result.status = "not_found"
+            self.notes.append(f"job board {board} answered {page.status}")
+            return
         if not self.result.company:
             self.result.company = board_company_name(board)
         self.result.careers_url = self.result.listings_url = board
         self.result.ats = ats
         self.result.method = "input-is-board"
         self.result.status = "listings_found"
-        return True
 
     def probe_paths(self, home: Page) -> list[Candidate]:
         p = urlparse(home.url)
@@ -877,7 +941,7 @@ class SiteScanner:
     def scan(self) -> Result:
         try:
             self._scan()
-            if not self.result.ats and self.result.status != "error":
+            if not self.result.ats:
                 found = self.probe_ats_boards()
                 if found:
                     self.result.ats, self.result.listings_url = found
@@ -893,13 +957,78 @@ class SiteScanner:
         return self.result
 
     def _scan(self) -> None:
+        """Two entry paths (plus pasted job boards):
+        homepage     -> find the careers link -> careers page -> listings
+        careers_page -> start at the careers page itself; the homepage is never requested,
+                        so a homepage that blocks scripts can't stop the scan
+        """
         res = self.result
-        if self.input_is_board():
+        if self.known and not self.careers_url:
+            self.scan_from_known()
             return
-        raw = res.input_url.strip()
-        # set early so the ATS-board fallback still works when the homepage blocks us
-        self.base_domain = registered_domain(urlparse(raw if "//" in raw else "https://" + raw).hostname)
-        home = self.load_home()
+        raw = (self.careers_url or res.input_url).strip()
+        url = raw if re.match(r"^https?://", raw, re.I) else "https://" + raw
+        res.input_type = classify_input(url)
+        if self.careers_url and res.input_type == "homepage":
+            res.input_type = "careers_page"  # given explicitly in the careers_url column
+        # set early so the ATS-board fallback still works when the first page blocks us
+        self.base_domain = registered_domain(urlparse(url).hostname)
+
+        if res.input_type == "job_board":
+            self.use_board(url)
+        elif res.input_type == "careers_page":
+            self.scan_from_careers_page(url)
+        else:
+            self.scan_from_homepage()
+
+    def scan_from_known(self) -> None:
+        """Start from the job board / careers page saved by an earlier run (known_sites.csv),
+        so the homepage is not needed. main() rediscovers from the homepage if this fails."""
+        res, k = self.result, self.known
+        res.source = "known"
+        res.company = res.company or k.get("company", "")
+        board, careers = k.get("listings_url", ""), k.get("careers_url", "")
+        start = board or careers
+        start = start if re.match(r"^https?://", start, re.I) else "https://" + start
+        self.base_domain = registered_domain(urlparse(start).hostname)
+        if board and classify_input(board) == "job_board":
+            res.input_type = "job_board"
+            self.use_board(board)
+            if res.status == "listings_found":
+                res.careers_url = careers or res.careers_url
+                res.method = f"known ({k.get('method') or 'saved'})"
+        else:
+            res.input_type = "careers_page"
+            self.scan_from_careers_page(start)
+            if res.method:
+                res.method = f"known+{res.method}"
+
+    def scan_from_careers_page(self, url: str) -> None:
+        res = self.result
+        page = self.fetch(url)
+        if (page is None or not page.ok) and self.args.render:
+            page = self.render(url) or page
+        if page is None or not page.ok:
+            res.status = "blocked" if self.rejections else "error"
+            self.notes.append(f"careers page unreachable (status {page.status if page else 'no response'})")
+            return  # scan() still tries the usual job-board addresses for the domain
+        res.final_url = page.url
+        homepage = url_key(f"https://{self.base_domain}/")
+        if url_key(page.url) == homepage:
+            self.notes.append("careers URL redirected to the homepage - searching it for a careers link")
+            self.scan_from_homepage(page)
+            return
+        self.home_key = homepage
+        if self.args.render and page.link_count < JS_LINK_THRESHOLD:
+            rendered = self.render(page.url)
+            if rendered and rendered.ok:
+                page = rendered
+        sig = analyze_page(page)
+        self.finish(page, sig, sig.score, "careers-input")
+
+    def scan_from_homepage(self, home: Page | None = None) -> None:
+        res = self.result
+        home = home or self.load_home()
         if home is None:
             res.status = "blocked" if self.rejections else "error"
             return
@@ -936,8 +1065,13 @@ class SiteScanner:
             self.notes.append("candidates found but none could be fetched")
             return
         cand, page, sig, total = best
+        self.finish(page, sig, total, method)
+
+    def finish(self, page: Page, sig: PageSignals, score: int, method: str) -> None:
+        """Record the chosen careers page and follow it through to the listings."""
+        res = self.result
         res.careers_url = page.url
-        res.score = total
+        res.score = score
         res.method = method
         if sig.reasons:
             self.notes.append("signals: " + ", ".join(sig.reasons))
@@ -963,6 +1097,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--render", action="store_true",
                     help="use headless Chromium (playwright) for JS-rendered sites")
     ap.add_argument("--ignore-robots", action="store_true", help="do not check robots.txt")
+    ap.add_argument("--known", default="known_sites.csv",
+                    help="saved careers pages / job boards reused on later runs (default known_sites.csv; "
+                         "'' to disable)")
+    ap.add_argument("--refresh", action="store_true",
+                    help="ignore saved entries and rediscover every site from its homepage")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -974,13 +1113,35 @@ def main(argv: list[str] | None = None) -> int:
     if not sites:
         log.error("no sites found in %s", args.input)
         return 1
-    log.info("Scanning %d sites with %d workers...\n", len(sites), args.workers)
+    known = load_known(args.known)
+    keys = [site_key(careers or url) for url, _, careers in sites]
+    n_reuse = sum(1 for k, (_, _, careers) in zip(keys, sites)
+                  if k in known and not careers and not args.refresh)
+    log.info("Scanning %d sites with %d workers (%d from saved entries in %s)...\n",
+             len(sites), args.workers, n_reuse, args.known or "-")
+
+    def run(url: str, name: str, careers: str, key: str) -> Result:
+        # an explicit careers_url in the input wins over a saved entry
+        entry = None if (careers or args.refresh) else known.get(key)
+        r = SiteScanner(url, name, args, careers, known=entry).scan()
+        if entry is None:
+            r.source = "discovered"
+            return r
+        if r.status in GOOD_STATUSES:
+            return r
+        # the saved URL stopped working (site redesign, moved board): rediscover from the input
+        first = r
+        r = SiteScanner(url, name, args, careers).scan()
+        r.source = "rediscovered"
+        r.notes = "; ".join(filter(None, [f"saved URL failed ({first.status}: {first.notes[:150]})", r.notes]))
+        r.rejected_requests = "; ".join(filter(None, [first.rejected_requests, r.rejected_requests]))
+        return r
 
     results: list[Result | None] = [None] * len(sites)
     done = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(SiteScanner(url, name, args).scan): i
-                   for i, (url, name) in enumerate(sites)}
+        futures = {pool.submit(run, url, name, careers, key): i
+                   for i, ((url, name, careers), key) in enumerate(zip(sites, keys))}
         for fut in as_completed(futures):
             i = futures[fut]
             r = results[i] = fut.result()
@@ -988,8 +1149,19 @@ def main(argv: list[str] | None = None) -> int:
             where = r.listings_url or r.careers_url or r.notes
             ats = f" [{r.ats}]" if r.ats else ""
             rejected = f"  (rejected: {r.rejected_requests})" if r.rejected_requests else ""
-            log.info("[%d/%d] %-30s %-19s%s %s%s", done, len(sites),
-                     r.input_url[:30], r.status, ats, where, rejected)
+            log.info("[%d/%d] %-30s %-12s %-12s %-19s%s %s%s", done, len(sites),
+                     r.input_url[:30], r.source, r.input_type, r.status, ats, where, rejected)
+
+    if args.known:
+        today = date.today().isoformat()
+        for key, r in zip(keys, results):
+            if r.status in GOOD_STATUSES:  # failures never overwrite a saved entry
+                method = known[key].get("method", "") if r.source == "known" else r.method
+                known[key] = {"key": key, "company": r.company, "input_url": r.input_url,
+                              "careers_url": r.careers_url, "listings_url": r.listings_url, "ats": r.ats,
+                              "method": method, "last_verified": today}
+        save_known(args.known, known)
+        log.info("Saved %d known sites to %s", len(known), args.known)
 
     with open(args.output, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=[fl.name for fl in fields(Result)])

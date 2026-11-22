@@ -27,13 +27,46 @@ Input is a `.txt` (one site per line, `#` comments allowed, optionally
 `Company Name, URL`) or a `.csv` with a `url`/`website` column (and optional
 `company` column).
 
-Each entry can be:
-- a **homepage** (`pfizer.com`): the normal case;
-- a **careers page** (`https://careers.astrazeneca.com`): useful when the homepage
-  blocks the script; the finder works from there to the job board;
-- the **job board itself** (`https://pfizer.wd1.myworkdayjobs.com/PfizerCareers`):
-  recognised and used as-is (`method` = `input-is-board`), no crawling. The company
-  name is taken from the board URL unless you give one.
+The scan starts one of two ways depending on the URL (shown in the `input_type` column):
+
+- **homepage** (`pfizer.com`): searches the homepage for a careers / jobs / join-us link,
+  then follows it to the careers page and on to the job listings.
+- **careers_page** (`https://careers.astrazeneca.com`, `https://www.medpace.com/careers/`,
+  `https://hr.mit.edu/jobs`): starts at that page and goes straight to the listings.
+  **The company homepage is never requested**, so a homepage that blocks scripts
+  can't stop the scan. Detected from a careers/jobs subdomain or a careers-like path.
+- **job_board** (`https://pfizer.wd1.myworkdayjobs.com/PfizerCareers`): a known job
+  board is used as-is (`method` = `input-is-board`), no crawling. The company name is
+  taken from the board URL unless you give one.
+
+In a CSV you can give both: a `careers_url` column, when filled, makes that row start
+from the careers page even if `url` holds the homepage:
+
+```csv
+company,url,careers_url
+AbbVie,abbvie.com,https://careers.abbvie.com
+Pfizer,pfizer.com,
+```
+
+If a homepage can't be used (refused, robots.txt, server error), the finder also tries
+`careers.<domain>` / `jobs.<domain>` and then the usual job-board addresses.
+
+### Saved sites: discover once, reuse after
+
+Every successful scan is saved to `known_sites.csv` (one row per company, keyed by its
+domain, so `pfizer.com`, `www.pfizer.com` and `careers.pfizer.com` share an entry). On later
+runs with the same input list, each saved company starts straight from its **saved job board**
+(or its saved careers page if no board was found), so the homepage is not needed.
+
+- If a saved URL stops working (redesign, board moved), that company is rediscovered from
+  the input URL and its entry is updated; the `source` column shows `rediscovered`.
+- Failed scans never overwrite a saved entry.
+- `source` in the results is `known`, `discovered` or `rediscovered`.
+- A filled `careers_url` in the input always wins over a saved entry.
+- `--refresh` rediscovers everything; `--known other.csv` uses another file; `--known ""` turns
+  saving off.
+- The file is plain CSV: edit it by hand, e.g. paste a company's job board into `listings_url`.
+  It is git-ignored.
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -61,7 +94,9 @@ Each entry can be:
    `boards.greenhouse.io/<name>`, etc. These rows are marked `ats-probe` in `method`;
    check they belong to the right company. If a Workday tenant exists but its site
    name can't be guessed, the notes say so; paste the board URL as input instead.
-6. If the homepage blocks the script, starts from `careers.<domain>` / `jobs.<domain>`.
+6. If the homepage can't be used, starts from `careers.<domain>` / `jobs.<domain>`.
+
+Tests: `python test_find_careers.py` (input detection) and `python test_classify.py`.
 
 For universities, student "Career Center" pages are scored down in favour of
 employment / HR job pages, and academic ranks (Assistant/Associate Professor,

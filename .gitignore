@@ -4,3 +4,5 @@ __pycache__/
 # scan output
 *results*.csv
 output/
+# saved careers pages / job boards (your own working data)
+known_sites.csv
