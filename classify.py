@@ -43,7 +43,9 @@ _STATE_ABBR_RES = [
     re.compile(r",\s*([A-Z]{2})(?:\s+\d{5}(?:-\d{4})?)?(?![A-Za-z])"),  # "Boston, MA" / "Boston, MA 02110"
     re.compile(r"\b(?:US|USA)\s*[-,:]?\s*([A-Z]{2})(?![A-Za-z])"),        # "USA - NY - New York", "US-MA-Boston", "US MA Remote"
     re.compile(r"\b([A-Z]{2})\s+\d{5}\b"),                                 # "MA 02110"
+    re.compile(r"\b(?:US|USA)\s*,\s*[A-Za-z .'-]+?\s([A-Z]{2})(?![A-Za-z])"),  # "US, Houston TX" (Lilly)
 ]
+_US_CITY_STATE_RE = re.compile(r"^(?:US|USA)\s*,\s*(.+?)\s([A-Z]{2})$")   # "US, San Diego CA" -> city
 _NON_US_RE = re.compile(
     r"\b(canada|mexico|brazil|argentina|chile|colombia|peru|united kingdom|england|scotland|wales|"
     r"ireland|france|germany|spain|italy|portugal|netherlands|belgium|switzerland|austria|sweden|"
@@ -116,6 +118,8 @@ def parse_location(text: str) -> LocationInfo:
     m = _DASH_FMT_RE.match(text)
     if m:
         info.city = m.group(2).strip()
+    elif (m := _US_CITY_STATE_RE.match(text)) and m.group(2) in STATE_ABBRS:
+        info.city = m.group(1).strip()
     elif (m := _CITY_RE.search(text)):
         info.city = m.group(1).split(" - ")[-1].strip()
     return info
@@ -188,6 +192,16 @@ _EDU_ABBRS_RE = {k: re.compile(v) for k, v in _EDU_ABBRS.items()}
 _DEGREE_CONTEXT_RE = re.compile(
     r"degree|education|diploma|qualif|bachelor|master|ph\.?\s?d|doctor|graduate|B\.?S\.?/|/M\.?S\b", re.I)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])|[\n;•]")
+# A short heading line that opens a requirements section ("Basic Qualifications", "What You'll Need");
+# the next few lines count as degree context even if they don't say "degree" ("B.S. or M.S. in Biochemistry")
+_REQ_HEADING_RE = re.compile(r"qualif|requirement|education|what you(?:'ll| will)? (?:need|bring)|must have|"
+                             r"who you are|minimum|preferred", re.I)
+REQ_SECTION_LINES = 3
+# "City, ST": a place name, removed before reading degree abbreviations (PhD, MD keeps its MD)
+_PLACE_RE = re.compile(r"\b[A-Z][a-z]+(?: [A-Z][a-z]+)*, [A-Z]{2}\b(?!\s*(?:/|or\b|and\b|degree))")
+# An abbreviation used as a degree: "B.S. or M.S.", "MS in Chemistry", "PhD and"
+_ABBR_DEGREE_PHRASE_RE = re.compile(
+    r"(?<![A-Za-z])(?:B\.?S\.?|M\.?S\.?|B\.A\.|M\.A\.|BSc|MSc|MBA|MPH|Ph\.?D\.?)\s+(?:in|or|and)\s+[A-Z(]")
 
 
 def _normalise(text: str) -> str:
@@ -198,9 +212,17 @@ def classify_education(text: str) -> tuple[list[str], str]:
     """Return (degree levels mentioned in order of EDU_ORDER, lowest level mentioned or 'Not stated')."""
     text = _normalise(text)
     found = {lvl for lvl, rx in _EDU_WORDS_RE.items() if rx.search(text)}
+    in_section = 0  # lines left under a requirements heading
     for sentence in _SENTENCE_SPLIT_RE.split(text):
-        if _DEGREE_CONTEXT_RE.search(sentence):
-            found |= {lvl for lvl, rx in _EDU_ABBRS_RE.items() if rx.search(sentence)}
+        s = sentence.strip()
+        if not s:
+            continue
+        if len(s) < 60 and not s.endswith(".") and _REQ_HEADING_RE.search(s):
+            in_section = REQ_SECTION_LINES + 1  # the heading itself plus the lines under it
+        if in_section or _DEGREE_CONTEXT_RE.search(s) or _ABBR_DEGREE_PHRASE_RE.search(s):
+            s = _PLACE_RE.sub(" ", s)  # "Rockville, MD" is a place, not a medical degree
+            found |= {lvl for lvl, rx in _EDU_ABBRS_RE.items() if rx.search(s)}
+        in_section = max(in_section - 1, 0)
     mentioned = [lvl for lvl in EDU_ORDER if lvl in found]
     if not mentioned:
         return [], EDU_NOT_STATED

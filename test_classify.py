@@ -11,6 +11,8 @@ LOCATIONS = [
     ("Washington, D.C.", True, ["DC"]),
     ("Remote - US", True, []),
     ("US MA Remote", True, ["MA"]),
+    ("US, Houston TX", True, ["TX"]),
+    ("US, San Diego CA", True, ["CA"]),
     ("Romania - Bucharest", False, []),
     ("CHN - JS - Jiangsu", False, []),
     ("Toronto, ON", False, []),
@@ -28,6 +30,13 @@ EDUCATION = [
     ("DVM or equivalent veterinary degree required.", ["Professional doctorate"], "Professional doctorate"),
     ("High school diploma or GED required.", ["High school/GED"], "High school/GED"),
     ("Experience with master data management.", [], "Not stated"),
+    # requirement under a heading, no "degree" word (Lilly)
+    ("Basic Qualifications\nB.S. or M.S. in Biochemistry, Biophysics, or a related discipline, typically with 2+ "
+     "years of hands-on cryo-EM experience.", ["Bachelor's", "Master's"], "Bachelor's"),
+    ("MS in Chemistry with 3 years of industry experience.", ["Master's"], "Master's"),
+    # not degrees: an MS Office line under a requirements heading, and a state abbreviation
+    ("Requirements\nProficiency with MS Office.\nBased in Rockville, MD.", [], "Not stated"),
+    ("Qualifications\nPhD, MD or PharmD in a life science discipline.", ["PhD", "Professional doctorate"], "PhD"),
 ]
 
 LEVELS = [

@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -78,7 +79,7 @@ PATH_TOKENS = {
     "open-positions": 8, "openings": 7, "vacancies": 7, "join-us": 7, "joinus": 7,
     "join-our-team": 7, "join": 4, "work-with-us": 7, "workwithus": 7,
     "work-for-us": 7, "employment": 4, "hiring": 4, "opportunities": 3,
-    "talent": 2, "search-jobs": 9, "job-search": 9,
+    "talent": 2, "search-jobs": 9, "job-search": 9, "search-results": 6,
 }
 STUDENT_CAREER_RE = re.compile(r"career[- ]?(?:center|centre|services|development|education|exploration)|"
                                r"handshake|student[- ]?(?:jobs|employment|career)|alumni", re.I)
@@ -136,6 +137,14 @@ ATS_PATTERNS = [
 # (?<![a-z0-9-]) stops "clever.co" matching "lever.co" etc.
 _ATS_RE = [(name, re.compile(r"(?<![a-z0-9-])(?:" + pat + ")")) for name, pat in ATS_PATTERNS]
 
+# Job-search pages of common career-site platforms (Phenom, Attrax, Radancy, SuccessFactors, ...),
+# tried when a careers page itself won't load
+CAREERS_SEARCH_PATHS = [
+    "/us/en/search-results", "/global/en/search-results", "/en/search-results", "/us/en", "/global/en",
+    "/en/jobs", "/en-us/jobs", "/jobs/search", "/search-jobs", "/en/search-jobs", "/jobs", "/search/?q=",
+    "/careers/search", "/job-search",
+]
+
 COMMON_PATHS = [
     "/careers", "/jobs", "/join-us", "/work-with-us", "/about/careers",
     "/about-us/careers", "/company/careers", "/en/careers", "/us/careers",
@@ -143,7 +152,7 @@ COMMON_PATHS = [
 ]
 
 # Workday data centres (wdN.myworkdayjobs.com), most common first, and usual external site names
-WORKDAY_DATACENTERS = (1, 5, 3, 12, 2, 10, 103, 108, 501)
+WORKDAY_DATACENTERS = (1, 5, 3, 12, 2, 10, 103, 108, 115, 501)
 WORKDAY_SITE_GUESSES = ("Careers", "External", "{Slug}Careers", "{slug}", "{slug}careers", "{slug}_careers",
                         "{slug}-careers", "ExternalCareers", "External_Careers", "Careers_External",
                         "{SLUG}", "{Slug}", "{Slug}_Careers", "jobs", "careers")
@@ -203,7 +212,26 @@ class Result:
     method: str = ""
     final_url: str = ""
     top_candidates: str = ""
+    manual_check: str = ""      # what to open by hand when no usable job board was found
+    requests: int = 0           # HTTP requests this company cost
     notes: str = ""
+
+
+def manual_check_note(r: Result) -> str:
+    """Tell the user which page to open by hand, and where to put what they find."""
+    paste = "paste the job listings URL into listings_url in known_sites.csv (or careers_url in the input)"
+    if r.status == "listings_found" and r.ats:
+        return ""
+    if r.status == "listings_found":
+        return f"no supported job board detected - open {r.listings_url} in a browser; {paste}"
+    if r.status == "careers_page_found":
+        return f"no job board detected - open {r.careers_url} in a browser, find the openings and {paste}"
+    if r.status == "blocked":
+        return f"site refuses scripts - open {r.input_url} in a browser, go to its careers page and {paste}"
+    if r.status == "not_found":
+        name = r.company or r.input_url
+        return f"no careers page found - search '{name} careers' in a browser and {paste}"
+    return f"could not load the site - check {r.input_url} in a browser and {paste}"
 
 
 # --------------------------------------------------------------------------- #
@@ -498,8 +526,22 @@ def load_sites(path: str) -> list[tuple[str, str, str]]:
     return sites
 
 
-KNOWN_FIELDS = ["key", "company", "input_url", "careers_url", "listings_url", "ats", "method", "last_verified"]
+KNOWN_FIELDS = ["key", "company", "input_url", "status", "careers_url", "listings_url", "ats", "method",
+                "last_verified", "last_checked", "manual_check"]
 GOOD_STATUSES = ("listings_found", "careers_page_found")
+
+
+def needs_manual(entry: dict) -> bool:
+    """A saved entry with no usable job board: the user should look at it by hand."""
+    status = entry.get("status") or ("listings_found" if entry.get("listings_url") else "careers_page_found")
+    return not entry.get("listings_url") and status != "listings_found"
+
+
+def checked_recently(entry: dict, days: int) -> bool:
+    try:
+        return (date.today() - date.fromisoformat(entry.get("last_checked", ""))).days < days
+    except ValueError:
+        return False
 
 
 def site_key(url: str) -> str:
@@ -585,6 +627,18 @@ def make_session() -> requests.Session:
 # Per-site scanner
 # --------------------------------------------------------------------------- #
 
+# robots.txt shared across scanners for one run: host -> (parser, 5xx status or 0)
+_ROBOTS_CACHE: dict[str, tuple[robotparser.RobotFileParser | None, int]] = {}
+_ROBOTS_LOCKS: dict[str, threading.Lock] = {}
+_ROBOTS_LOCKS_GUARD = threading.Lock()
+
+
+def _robots_lock(host: str) -> threading.Lock:
+    """One lock per host, so two scanners don't fetch the same robots.txt at once."""
+    with _ROBOTS_LOCKS_GUARD:
+        return _ROBOTS_LOCKS.setdefault(host, threading.Lock())
+
+
 class SiteScanner:
     def __init__(self, input_url: str, company: str, args: argparse.Namespace, careers_url: str = "",
                  known: dict | None = None):
@@ -598,6 +652,7 @@ class SiteScanner:
         self.robots: dict[str, robotparser.RobotFileParser | None] = {}
         self.robots_errors: dict[str, int] = {}  # host -> 5xx status its robots.txt returned
         self.rejections: dict[str, str] = {}  # "host status vendor" -> first URL refused
+        self.requests = 0                     # HTTP requests this company cost
         self.base_domain = ""
         self.home_key = ""
 
@@ -609,26 +664,37 @@ class SiteScanner:
     # ---- networking ------------------------------------------------------- #
 
     def _robots_for(self, url: str) -> robotparser.RobotFileParser | None:
+        """robots.txt for url's host, fetched once per run and shared by all scanners
+        (many companies probe the same hosts: api.lever.co, boards-api.greenhouse.io, ...)."""
         p = urlparse(url)
         host = f"{p.scheme}://{p.netloc}"
         if host not in self.robots:
-            rp = None
-            try:
-                # not recorded as a rejection: real blocks show up on the page request itself,
-                # and guessed ATS hosts answer 401/403 here for boards that don't exist
-                r = self.session.get(host + "/robots.txt", timeout=self.args.timeout)
-                rp = robotparser.RobotFileParser()
-                if r.status_code == 200:
-                    rp.parse(r.text.splitlines())
-                elif r.status_code >= 500:  # RFC 9309: server error -> assume disallow all
-                    rp.disallow_all = True
-                    self.robots_errors[host] = r.status_code
-                else:                       # 4xx / missing -> allow all
-                    rp.allow_all = True
-            except requests.RequestException:
-                rp = None
-            self.robots[host] = rp
+            with _robots_lock(host):
+                if host not in _ROBOTS_CACHE:
+                    _ROBOTS_CACHE[host] = self._fetch_robots(host)
+            self.robots[host], err = _ROBOTS_CACHE[host]
+            if err:
+                self.robots_errors[host] = err
         return self.robots[host]
+
+    def _fetch_robots(self, host: str) -> tuple[robotparser.RobotFileParser | None, int]:
+        rp, err = None, 0
+        try:
+            # not recorded as a rejection: real blocks show up on the page request itself,
+            # and guessed ATS hosts answer 401/403 here for boards that don't exist
+            self.requests += 1
+            r = self.session.get(host + "/robots.txt", timeout=self.args.timeout)
+            rp = robotparser.RobotFileParser()
+            if r.status_code == 200:
+                rp.parse(r.text.splitlines())
+            elif r.status_code >= 500:  # RFC 9309: server error -> assume disallow all
+                rp.disallow_all = True
+                err = r.status_code
+            else:                       # 4xx / missing -> allow all
+                rp.allow_all = True
+        except requests.RequestException:
+            rp = None
+        return rp, err
 
     def allowed(self, url: str) -> bool:
         if self.args.ignore_robots:
@@ -645,6 +711,7 @@ class SiteScanner:
                                   f"disallowed, retry later" if err else f"robots.txt disallows {url}")
             return None
         time.sleep(self.args.delay)
+        self.requests += 1
         try:
             r = self.session.get(url, timeout=self.args.timeout, allow_redirects=True)
         except requests.RequestException as e:
@@ -689,6 +756,7 @@ class SiteScanner:
                 browser = p.chromium.launch(headless=True)
                 try:
                     pg = browser.new_page(user_agent=USER_AGENT)
+                    self.requests += 1  # page load only; the browser's own asset requests aren't counted
                     resp = pg.goto(url, timeout=self.args.timeout * 2000, wait_until="domcontentloaded")
                     pg.wait_for_timeout(2500)
                     html = pg.content()
@@ -727,6 +795,11 @@ class SiteScanner:
                 if page and page.ok:
                     self.notes.append(f"homepage unusable - started from {sub}.{bare}")
                     return page
+                if page is not None:  # the host exists but its root failed: try its search pages
+                    page = self.try_search_pages(f"https://{sub}.{bare}")
+                    if page:
+                        self.notes.append(f"homepage unusable - started from search page {page.url}")
+                        return page
         if self.args.render:
             page = self.render(raw)
             if page and page.ok:
@@ -751,6 +824,26 @@ class SiteScanner:
         self.result.ats = ats
         self.result.method = "input-is-board"
         self.result.status = "listings_found"
+
+    def try_search_pages(self, origin: str, skip: str = "") -> Page | None:
+        """Workaround for a careers page that won't load (e.g. careers.lilly.com refuses its root
+        but serves /us/en): try the job-search pages career-site platforms usually have.
+        Gives up after a few refusals in a row, since the whole host is then probably blocked."""
+        refused = 0
+        for path in CAREERS_SEARCH_PATHS:
+            url = origin + path
+            if url_key(url) == url_key(skip):
+                continue
+            page = self.fetch(url)
+            if page is not None and page.ok and url_key(page.url) != url_key(f"https://{self.base_domain}/"):
+                sig = analyze_page(page)
+                if sig.ats or sig.score >= MIN_PAGE_SCORE:
+                    return page
+            refused = refused + 1 if page is not None and page.status in (401, 403, 405, 406, 429, 451) else 0
+            if refused >= 3:
+                self.notes.append(f"{urlparse(origin).netloc} refused 3 search pages in a row - stopped trying")
+                return None
+        return None
 
     def probe_paths(self, home: Page) -> list[Candidate]:
         p = urlparse(home.url)
@@ -842,25 +935,29 @@ class SiteScanner:
         cands, _ = extract_candidates(page.html, page.url, self.base_domain, LISTING_PHRASES)
         here = url_key(page.url)
         cands = [c for c in cands if url_key(c.url) != here and c.score >= MIN_LISTING_SCORE]
+        fallback = ""
         if cands:
             target = cands[0]
             ats = detect_ats(target.url) or sig.ats
-            if not detect_ats(target.url):
-                # one more hop: the "search jobs" page may itself hand off to an ATS
-                nxt = self.fetch(target.url)
-                if nxt and nxt.ok:
-                    s2 = analyze_page(nxt)
-                    ats = s2.ats or ats
-                    if s2.ats_url and not s2.jobposting and detect_ats(s2.ats_url) and \
-                            urlparse(s2.ats_url).path.strip("/"):
-                        return s2.ats_url, ats
-                    return nxt.url, ats
-            return target.url, ats
+            if detect_ats(target.url):
+                return target.url, ats
+            # one more hop: the "search jobs" page may itself hand off to an ATS
+            nxt = self.fetch(target.url)
+            if nxt and nxt.ok:
+                s2 = analyze_page(nxt)
+                ats = s2.ats or ats
+                if s2.ats_url and not s2.jobposting and detect_ats(s2.ats_url) and \
+                        urlparse(s2.ats_url).path.strip("/"):
+                    return s2.ats_url, ats
+                return nxt.url, ats
+            # the listings link was refused or broken (e.g. a blocked site root): don't report it
+            # as the job board if this page itself already shows where the jobs are
+            fallback = target.url
         if sig.ats_url:
             return sig.ats_url, sig.ats
         if sig.ats:  # ATS script embedded but no link: jobs render on this page
             return page.url, sig.ats
-        return "", ""
+        return fallback, ""
 
     # ---- main ------------------------------------------------------------- #
 
@@ -909,6 +1006,7 @@ class SiteScanner:
         if not self.allowed(url):
             return None
         time.sleep(self.args.delay)
+        self.requests += 1
         try:
             return self.session.post(url, json=body, timeout=self.args.timeout, allow_redirects=False,
                                      headers={"Accept": "application/json"})
@@ -954,6 +1052,8 @@ class SiteScanner:
             self.notes.append(f"{type(e).__name__}: {e}")
         self.result.rejected_requests = "; ".join(self.rejections)
         self.result.notes = "; ".join(dict.fromkeys(self.notes))
+        self.result.requests = self.requests
+        self.result.manual_check = manual_check_note(self.result)
         return self.result
 
     def _scan(self) -> None:
@@ -1009,9 +1109,15 @@ class SiteScanner:
         if (page is None or not page.ok) and self.args.render:
             page = self.render(url) or page
         if page is None or not page.ok:
-            res.status = "blocked" if self.rejections else "error"
-            self.notes.append(f"careers page unreachable (status {page.status if page else 'no response'})")
-            return  # scan() still tries the usual job-board addresses for the domain
+            status = page.status if page else "no response"
+            p = urlparse(url)
+            page = self.try_search_pages(f"{p.scheme}://{p.netloc}", skip=url)
+            if page is None:
+                res.status = "blocked" if self.rejections else "error"
+                self.notes.append(f"careers page unreachable (status {status}), and none of its usual "
+                                  f"search pages loaded")
+                return  # scan() still tries the usual job-board addresses for the domain
+            self.notes.append(f"careers page unreachable (status {status}) - used its search page {page.url}")
         res.final_url = page.url
         homepage = url_key(f"https://{self.base_domain}/")
         if url_key(page.url) == homepage:
@@ -1098,10 +1204,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="use headless Chromium (playwright) for JS-rendered sites")
     ap.add_argument("--ignore-robots", action="store_true", help="do not check robots.txt")
     ap.add_argument("--known", default="known_sites.csv",
-                    help="saved careers pages / job boards reused on later runs (default known_sites.csv; "
-                         "'' to disable)")
+                    help="saved careers pages / job boards reused on later runs (default known_sites.csv)")
+    ap.add_argument("--no-known", action="store_true", help="don't read or update the saved-sites file")
     ap.add_argument("--refresh", action="store_true",
                     help="ignore saved entries and rediscover every site from its homepage")
+    ap.add_argument("--recheck-days", type=int, default=30,
+                    help="skip saved sites that need a manual check until they are this many days old "
+                         "(default 30); paste a job board into known_sites.csv to use it sooner")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -1113,6 +1222,8 @@ def main(argv: list[str] | None = None) -> int:
     if not sites:
         log.error("no sites found in %s", args.input)
         return 1
+    if args.no_known:
+        args.known = ""
     known = load_known(args.known)
     keys = [site_key(careers or url) for url, _, careers in sites]
     n_reuse = sum(1 for k, (_, _, careers) in zip(keys, sites)
@@ -1123,6 +1234,17 @@ def main(argv: list[str] | None = None) -> int:
     def run(url: str, name: str, careers: str, key: str) -> Result:
         # an explicit careers_url in the input wins over a saved entry
         entry = None if (careers or args.refresh) else known.get(key)
+        if entry and needs_manual(entry):
+            if checked_recently(entry, args.recheck_days):
+                # nothing new to find yet: don't repeat the same search, point at the manual step
+                r = Result(input_url=url, company=name or entry.get("company", ""), source="known",
+                           status=entry.get("status") or "careers_page_found",
+                           careers_url=entry.get("careers_url", ""))
+                r.manual_check = entry.get("manual_check") or manual_check_note(r)
+                r.notes = (f"skipped: checked {entry['last_checked']} with no job board found; rechecked after "
+                           f"{args.recheck_days} days or with --refresh")
+                return r
+            entry = None  # due for a full recheck from the homepage
         r = SiteScanner(url, name, args, careers, known=entry).scan()
         if entry is None:
             r.source = "discovered"
@@ -1149,19 +1271,33 @@ def main(argv: list[str] | None = None) -> int:
             where = r.listings_url or r.careers_url or r.notes
             ats = f" [{r.ats}]" if r.ats else ""
             rejected = f"  (rejected: {r.rejected_requests})" if r.rejected_requests else ""
-            log.info("[%d/%d] %-30s %-12s %-12s %-19s%s %s%s", done, len(sites),
-                     r.input_url[:30], r.source, r.input_type, r.status, ats, where, rejected)
+            log.info("[%d/%d] %-30s %-12s %-12s %-19s %3d req%s %s%s", done, len(sites),
+                     r.input_url[:30], r.source, r.input_type, r.status, r.requests, ats, where, rejected)
 
     if args.known:
         today = date.today().isoformat()
         for key, r in zip(keys, results):
-            if r.status in GOOD_STATUSES:  # failures never overwrite a saved entry
-                method = known[key].get("method", "") if r.source == "known" else r.method
-                known[key] = {"key": key, "company": r.company, "input_url": r.input_url,
-                              "careers_url": r.careers_url, "listings_url": r.listings_url, "ats": r.ats,
-                              "method": method, "last_verified": today}
+            old = known.get(key, {})
+            if r.notes.startswith("skipped:"):
+                continue  # not scanned this run: leave the entry as it is
+            if r.status not in GOOD_STATUSES and old and not needs_manual(old):
+                continue  # a failure never overwrites a working saved entry
+            if r.source == "known" and old.get("status") == "listings_found":
+                method = old.get("method", "")
+            elif r.source == "known" and r.status == "listings_found":
+                method = "manual (known_sites.csv)"  # the user pasted a board into a needs-manual entry
+            else:
+                method = r.method
+            verified = r.status == "listings_found" or (r.status in GOOD_STATUSES and bool(r.listings_url))
+            known[key] = {"key": key, "company": r.company or old.get("company", ""), "input_url": r.input_url,
+                          "status": r.status, "careers_url": r.careers_url or old.get("careers_url", ""),
+                          "listings_url": r.listings_url, "ats": r.ats, "method": method,
+                          "last_verified": today if verified else old.get("last_verified", ""),
+                          "last_checked": today, "manual_check": r.manual_check}
         save_known(args.known, known)
-        log.info("Saved %d known sites to %s", len(known), args.known)
+        n_manual = sum(1 for e in known.values() if needs_manual(e))
+        log.info("Saved %d known sites to %s (%d need a manual check - see the manual_check column)",
+                 len(known), args.known, n_manual)
 
     with open(args.output, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=[fl.name for fl in fields(Result)])

@@ -25,6 +25,7 @@ from bs4 import BeautifulSoup
 
 from classify import is_us_country, parse_location, state_abbr
 from find_careers import describe_rejection
+from job_details import extract_salary, salary_fields
 
 
 @dataclass
@@ -52,6 +53,24 @@ class Job:
     career_level: str = ""
     level_source: str = ""
     keywords: list[str] = field(default_factory=list)
+    # details pulled from the posting (job_details.py); empty when the posting doesn't say
+    salary_min: float | None = None
+    salary_max: float | None = None
+    salary_currency: str = ""
+    salary_period: str = ""          # hour | week | month | year
+    salary_annual_mid: float | None = None  # midpoint per year (hourly x 2080), for comparing
+    salary_source: str = ""          # job board | description
+    work_arrangement: str = ""       # remote | hybrid | on-site
+    schedule: str = ""               # full-time | part-time
+    employment_term: str = ""        # permanent | fixed-term | contract | internship
+    contract_months: int | str = ""
+    shifts: str = ""
+    travel: str = ""                 # "up to 25%" | none | required
+    visa_sponsorship: str = ""       # offered | not offered
+    relocation: str = ""             # offered | possible ("may be available") | not offered
+    bonus: str = ""
+    equity: str = ""
+    certifications: list[str] = field(default_factory=list)
     detail_error: str = ""
     # client-private data needed by enrich()
     meta: dict = field(default_factory=dict, repr=False)
@@ -62,6 +81,17 @@ def html_to_text(html: str) -> str:
         return ""
     text = BeautifulSoup(html, "html.parser").get_text("\n")
     return re.sub(r"\n\s*\n+", "\n", text).strip()
+
+
+def structured_salary(low, high, currency, interval) -> dict:
+    """Salary from a job board's own pay fields (Ashby, Lever, schema.org baseSalary)."""
+    try:
+        low, high = float(low), float(high if high is not None else low)
+    except (TypeError, ValueError):
+        return {}
+    iv = str(interval or "").lower()
+    period = next((p for p in ("hour", "week", "month", "year") if p in iv), "year")
+    return salary_fields(min(low, high), max(low, high), (currency or "USD").upper(), period, "job board")
 
 
 def jobposting_ld(html: str) -> dict | None:
@@ -96,6 +126,13 @@ def apply_jobposting(job: Job, data: dict) -> None:
                                   if a.get("addressLocality") not in (None, "", "UNAVAILABLE")), ""))
     if "TELECOMMUTE" in str(data.get("jobLocationType", "")).upper():
         job.remote = True
+        job.meta.setdefault("arrangement", "remote")
+    base = data.get("baseSalary") or {}
+    if isinstance(base, dict) and not job.meta.get("salary"):
+        value = base.get("value") if isinstance(base.get("value"), dict) else {"value": base.get("value")}
+        if (sal := structured_salary(value.get("minValue", value.get("value")), value.get("maxValue"),
+                                     base.get("currency"), value.get("unitText") or base.get("unitText"))):
+            job.meta["salary"] = sal
 
 
 def apply_location(job: Job, texts: list[str], countries: list[str] = (), regions: list[str] = (),
@@ -118,6 +155,7 @@ def apply_location(job: Job, texts: list[str], countries: list[str] = (), region
     states = [state_abbr(r) for r in regions if state_abbr(r)] + [s for i in infos for s in i.states]
     job.states = list(dict.fromkeys(states)) if job.is_us else []
     job.city = city or job.city or next((i.city for i in infos if i.city), "")
+    job.city = re.sub(r",\s*[A-Z]{2}$", "", job.city)  # "North Chicago, IL" -> "North Chicago" (state is in states)
     if not job.city and job.is_us and infos and infos[0].is_us is None and not infos[0].remote:
         job.city = texts[0]  # bare site name such as "Lincoln" or "Kalamazoo - Portage Road"
     job.remote = job.remote or any(i.remote for i in infos)
@@ -366,6 +404,10 @@ class LeverClient(ATSClient):
                             remote=(j.get("workplaceType") == "remote"))
             apply_location(job, [cat.get("location", "")] + list(cat.get("allLocations") or []),
                            [j.get("country", "")])
+            job.meta["arrangement"] = j.get("workplaceType", "")
+            sr = j.get("salaryRange") or {}  # {"min", "max", "currency", "interval": "per-year-salary"}
+            if (sal := structured_salary(sr.get("min"), sr.get("max"), sr.get("currency"), sr.get("interval"))):
+                job.meta["salary"] = sal
             jobs.append(job)
         self.total_openings = len(jobs)
         return jobs
@@ -382,7 +424,8 @@ class AshbyClient(ATSClient):
         self.org = segs[0]
 
     def list_jobs(self, us_only=True):
-        data = self.get(f"https://api.ashbyhq.com/posting-api/job-board/{self.org}").json()
+        data = self.get(f"https://api.ashbyhq.com/posting-api/job-board/{self.org}",
+                        params={"includeCompensation": "true"}).json()
         jobs = []
         for j in data.get("jobs", []):
             if j.get("isListed") is False:
@@ -398,6 +441,13 @@ class AshbyClient(ATSClient):
                            [a.get("addressCountry", "") for a in addrs],
                            [a.get("addressRegion", "") for a in addrs],
                            city=addrs[0].get("addressLocality", ""))
+            job.meta["arrangement"] = j.get("workplaceType", "")
+            for comp in ((j.get("compensation") or {}).get("summaryComponents") or []):
+                if comp.get("compensationType") == "Salary":
+                    if (sal := structured_salary(comp.get("minValue"), comp.get("maxValue"),
+                                                 comp.get("currencyCode"), comp.get("interval"))):
+                        job.meta["salary"] = sal
+                    break
             jobs.append(job)
         self.total_openings = len(jobs)
         return jobs
@@ -480,6 +530,7 @@ class EightfoldClient(ATSClient):
                 # standardizedLocations look like "Iowa,US" / "Lombardy,IT"
                 std = p.get("standardizedLocations") or []
                 apply_location(job, p.get("locations") or [], [s.rsplit(",", 1)[-1] for s in std])
+                job.meta["arrangement"] = p.get("workLocationOption") or ""
                 if std and job.is_us is None:
                     job.is_us = False
                 jobs.append(job)
@@ -708,6 +759,10 @@ class AttraxClient(ATSClient):
         # tiles carry slugged option values as classes, e.g. attrax-vacancy-tile--united-states-of-america
         countries = ["United States"] if "attrax-vacancy-tile--united-states" in " ".join(tile.get("class", [])) else []
         apply_location(job, fields.get("Location", [])[:3], countries)
+        job.meta["arrangement"] = first("Work location type")
+        if first("Salary") and (sal := extract_salary("Salary " + first("Salary"))):
+            sal["salary_source"] = "job board"
+            job.meta["salary"] = sal
         return job
 
     def enrich(self, job):
@@ -762,6 +817,7 @@ class OracleClient(ATSClient):
                 second = r.get("secondaryLocations") or []
                 apply_location(job, [r.get("PrimaryLocation", "")] + [s.get("Name", "") for s in second],
                                [r.get("PrimaryLocationCountry", "")] + [s.get("CountryCode", "") for s in second])
+                job.meta["arrangement"] = r.get("WorkplaceTypeCode") or r.get("WorkplaceType") or ""
                 jobs.append(job)
         self.total_openings = total
         return jobs

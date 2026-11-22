@@ -28,12 +28,14 @@ import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
+from statistics import median
 from urllib.parse import urlparse
 
 from ats_clients import CLIENTS, Job, RobotsDisallowed
 from classify import (EDU_NOT_STATED, EDU_ORDER, LEVEL_UNSPECIFIED, LEVELS, classify_education,
                       classify_level, infer_missing_states, min_years_experience)
 from find_careers import make_session, registered_domain
+from job_details import extract_details, extract_salary
 
 log = logging.getLogger("career_sifter.jobs")
 
@@ -54,6 +56,7 @@ class CompanyReport:
     location_unknown: int = 0
     jobs: list[Job] = field(default_factory=list)   # US jobs (or all, with --all-locations)
     notes: list[str] = field(default_factory=list)
+    manual_check: str = ""  # what to open by hand when the openings couldn't be collected
 
 
 def load_keywords(spec: str | None) -> list[str]:
@@ -79,6 +82,14 @@ def classify_job(job: Job, kw_res: dict[str, re.Pattern]) -> None:
     haystack = f"{job.title}\n{text}"
     job.keywords = [k for k, rx in kw_res.items() if rx.search(haystack)]
 
+    # salary: the job board's own pay fields first, else the description
+    for k, v in (job.meta.get("salary") or extract_salary(text)).items():
+        setattr(job, k, v)
+    for k, v in extract_details(text, job.title, job.employment_type, job.meta.get("arrangement", "")).items():
+        setattr(job, k, v)
+    if not job.work_arrangement and job.remote:
+        job.work_arrangement = "remote"
+
 
 def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pattern]) -> CompanyReport:
     input_url = row.get("input_url", "")
@@ -92,14 +103,17 @@ def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pa
     if row.get("status") not in USABLE_STATUSES:  # blocked / not_found / error in find_careers
         rep.status = row.get("status") or "error"
         rep.rejected_requests = finder_rejections
+        rep.manual_check = row.get("manual_check", "")
         rep.notes.append(f"careers page not found by find_careers: {row.get('notes', '')}".rstrip(": "))
         return rep
     if not ats:
         rep.status = "no_ats"
+        rep.manual_check = row.get("manual_check") or f"no job board detected - open {board} in a browser"
         rep.notes.append("no job board detected - check careers page manually")
         return rep
     if ats not in CLIENTS:
         rep.status = "unsupported_ats"
+        rep.manual_check = f"{ats} job boards aren't supported yet - open {board} in a browser to see the openings"
         rep.notes.append(f"{ats} not supported yet")
         return rep
 
@@ -111,6 +125,8 @@ def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pa
         jobs = client.list_jobs(us_only=not args.all_locations)
     except RobotsDisallowed as e:
         rep.status = "robots_disallowed"
+        rep.manual_check = (f"the job board asks scripts not to read it - open {board} in a browser "
+                            f"(or rerun with --ignore-robots)")
         rep.notes.append(f"{e} - skipped (use --ignore-robots to override)")
         rep.rejected_requests = finder_rejections
         return rep
@@ -119,6 +135,7 @@ def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pa
         rep.status = "blocked" if rejected else "error"
         rep.notes.append(f"listing failed: {type(e).__name__}: {e}"[:300])
         rep.rejected_requests = join_rejections(finder_rejections, client.rejections if client else None)
+        rep.manual_check = f"the job board could not be read - open {board} in a browser"
         return rep
     rep.total_openings = client.total_openings if client.total_openings is not None else len(jobs)
 
@@ -176,7 +193,8 @@ def join_rejections(finder: str, client_counts: Counter | None) -> str:
 # --------------------------------------------------------------------------- #
 
 def summary_row(name: str, ats: str, status: str, total, us: int, unknown: int, jobs: list[Job],
-                keywords: list[str], board: str = "", notes: str = "", rejected: str = "") -> dict:
+                keywords: list[str], board: str = "", notes: str = "", rejected: str = "",
+                manual: str = "") -> dict:
     us_jobs = [j for j in jobs if j.is_us]
     edu = Counter(j.min_education for j in us_jobs)
     lvl = Counter(j.career_level for j in us_jobs)
@@ -191,8 +209,20 @@ def summary_row(name: str, ats: str, status: str, total, us: int, unknown: int, 
     }
     row.update({col: edu.get(lvl_name, 0) for lvl_name, col in EDU_COLUMNS.items()})
     row.update({col: lvl.get(lvl_name, 0) for lvl_name, col in LEVEL_COLUMNS.items()})
+    paid = sorted(j.salary_annual_mid for j in us_jobs if j.salary_annual_mid and j.salary_currency == "USD")
+    arrangement = Counter(j.work_arrangement for j in us_jobs)
+    term = Counter(j.employment_term for j in us_jobs)
+    row.update({
+        "pay_disclosed": len(paid),
+        "median_pay_annual_usd": round(median(paid)) if paid else "",
+        "remote": arrangement.get("remote", 0), "hybrid": arrangement.get("hybrid", 0),
+        "on_site": arrangement.get("on-site", 0),
+        "internships": term.get("internship", 0), "fixed_term_or_contract": term.get("fixed-term", 0) + term.get(
+            "contract", 0),
+        "visa_sponsorship_not_offered": sum(1 for j in us_jobs if j.visa_sponsorship == "not offered"),
+    })
     row.update({f"kw_{k}": sum(1 for j in us_jobs if k in j.keywords) for k in keywords})
-    row.update({"board_url": board, "notes": notes})
+    row.update({"board_url": board, "manual_check": manual, "notes": notes})
     return row
 
 
@@ -200,7 +230,8 @@ def write_outputs(reports: list[CompanyReport], keywords: list[str], out_dir: st
     os.makedirs(out_dir, exist_ok=True)
 
     rows = [summary_row(r.company, r.ats, r.status, r.total_openings, r.us_openings, r.location_unknown,
-                        r.jobs, keywords, r.board_url, "; ".join(r.notes), r.rejected_requests) for r in reports]
+                        r.jobs, keywords, r.board_url, "; ".join(r.notes), r.rejected_requests, r.manual_check)
+            for r in reports]
     ok = [r for r in reports if r.status == "ok"]
     n_rejected = sum(1 for r in reports if r.rejected_requests)
     rows.append(summary_row("ALL", "", f"{len(ok)}/{len(reports)} ok",
@@ -227,7 +258,11 @@ def write_outputs(reports: list[CompanyReport], keywords: list[str], out_dir: st
                 w.writerow([r.company, s, city, n])
 
     job_cols = ["company", "ats", "title", "career_level", "level_source", "level_raw", "min_education",
-                "education_mentioned", "min_years_experience", "keywords", "city", "states", "locations",
+                "education_mentioned", "min_years_experience",
+                "salary_min", "salary_max", "salary_currency", "salary_period", "salary_annual_mid", "salary_source",
+                "work_arrangement", "schedule", "employment_term", "contract_months", "shifts", "travel",
+                "visa_sponsorship", "relocation", "bonus", "equity", "certifications",
+                "keywords", "city", "states", "locations",
                 "remote", "is_us", "department", "employment_type", "posted", "url", "job_id", "detail_error"]
     all_jobs = [j for r in reports for j in r.jobs]
     with open(os.path.join(out_dir, "jobs.csv"), "w", newline="", encoding="utf-8") as f:
@@ -235,7 +270,7 @@ def write_outputs(reports: list[CompanyReport], keywords: list[str], out_dir: st
         w.writeheader()
         for j in all_jobs:
             d = asdict(j)
-            for k in ("education_mentioned", "keywords", "states"):
+            for k in ("education_mentioned", "keywords", "states", "certifications"):
                 d[k] = "; ".join(d[k])
             d["locations"] = " | ".join(d["locations"])
             w.writerow(d)

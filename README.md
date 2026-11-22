@@ -51,6 +51,14 @@ Pfizer,pfizer.com,
 If a homepage can't be used (refused, robots.txt, server error), the finder also tries
 `careers.<domain>` / `jobs.<domain>` and then the usual job-board addresses.
 
+**Search-page workaround:** if a careers page won't load, the finder tries that site's
+job-search pages, the paths career-site platforms usually use (`/us/en/search-results`,
+`/us/en`, `/en/jobs`, `/search-jobs`, `/jobs/search`, ...). Some sites refuse only their
+root: `careers.lilly.com` answers 403, but `careers.lilly.com/us/en/search-results` loads
+and links to Lilly's real Workday board. It stops after 3 refusals in a row (the whole
+host is then probably blocked). You can also paste a search URL directly as the
+careers page.
+
 ### Saved sites: discover once, reuse after
 
 Every successful scan is saved to `known_sites.csv` (one row per company, keyed by its
@@ -60,10 +68,22 @@ runs with the same input list, each saved company starts straight from its **sav
 
 - If a saved URL stops working (redesign, board moved), that company is rediscovered from
   the input URL and its entry is updated; the `source` column shows `rediscovered`.
-- Failed scans never overwrite a saved entry.
+- Failed scans never overwrite a working saved entry.
+- **Companies with no usable job board are remembered too** (careers page without a
+  board, blocked, not found). The `manual_check` column says which page to open by hand,
+  e.g. *"no job board detected - open https://www.schrodinger.com/company/careers/ in a
+  browser, find the openings and paste the job listings URL into listings_url in
+  known_sites.csv"*. Later runs skip these (0 requests) instead of repeating the same
+  search, until `--recheck-days` (default 30) have passed or you use `--refresh`.
+  Once you paste the job board into `listings_url`, the next run uses it
+  (`method` = `manual (known_sites.csv)`).
+- The `requests` column shows how many HTTP requests each company cost. In testing, a
+  rerun of 5 companies dropped from 101 requests to 6.
+- `manual_check` also appears in `fetch_jobs.py`'s `summary.csv`, including for job
+  boards that are unsupported, unreadable, or ask scripts not to read them.
 - `source` in the results is `known`, `discovered` or `rediscovered`.
 - A filled `careers_url` in the input always wins over a saved entry.
-- `--refresh` rediscovers everything; `--known other.csv` uses another file; `--known ""` turns
+- `--refresh` rediscovers everything; `--known other.csv` uses another file; `--no-known` turns
   saving off.
 - The file is plain CSV: edit it by hand, e.g. paste a company's job board into `listings_url`.
   It is git-ignored.
@@ -140,10 +160,35 @@ Output (in `output/`):
 
 | File | Contents |
 |---|---|
-| `summary.csv` | per company + ALL: status, rejected requests (from both steps, with counts), total, US count and %, top states, education and level counts, keyword counts. Blocked companies stay listed. |
+| `summary.csv` | per company + ALL: status, rejected requests (from both steps, with counts), total, US count and %, top states, education and level counts, pay disclosed / median annual pay, remote / hybrid / on-site, internships, fixed-term or contract, visa sponsorship not offered, keyword counts, manual check. Blocked companies stay listed. |
 | `us_locations.csv` | US openings per company / state / city |
-| `jobs.csv` | one row per US job with all tags and its URL |
+| `jobs.csv` | one row per US job with all tags, details and its URL |
 | `jobs.jsonl` | the same jobs including full description text |
+
+### Details pulled from each posting (`job_details.py`)
+
+Taken from the job board's own fields when it has them (Ashby/Lever pay, schema.org
+`baseSalary`, Attrax's salary and "Work location type", Oracle/Eightfold/Lever/Ashby
+workplace type), otherwise from the description text. Anything a posting doesn't
+state is left empty, not guessed.
+
+| Column | Values |
+|---|---|
+| `salary_min`, `salary_max`, `salary_currency`, `salary_period` | e.g. 72000 / 189200 / USD / year; hourly pay keeps `hour` |
+| `salary_annual_mid` | midpoint per year (hourly x 2080), for comparing |
+| `salary_source` | `job board` or `description` |
+| `work_arrangement` | remote / hybrid / on-site |
+| `schedule` | full-time / part-time |
+| `employment_term`, `contract_months` | permanent / fixed-term / contract / internship, and length if stated |
+| `shifts` | day, night, weekend, 1st/2nd/3rd, 12-hour, rotating ... |
+| `travel` | "up to 25%", none, or required |
+| `visa_sponsorship` | offered / not offered |
+| `relocation` | offered / possible ("may be available") / not offered |
+| `bonus`, `equity` | yes when mentioned |
+| `certifications` | PMP, Six Sigma, ASQ, CCRP/ACRP, RAC, ASCP/MLS, RN, pharmacist, vet tech, veterinary or medical licence, AALAS, crop adviser, CPA, PE, cloud, CISSP, PHR/SHRM, CDL |
+
+Bonus and equity are often standard wording on every posting of a company, so they
+say more about the company than the role. Checks: `python test_job_details.py`.
 
 Useful flags: `--all-locations` (tag non-US jobs too), `--max-jobs 20` (quick test),
 `--keywords @keywords.txt` (one per line), `--delay`, `--workers`, `--detail-workers`.
