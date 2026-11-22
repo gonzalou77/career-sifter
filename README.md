@@ -266,6 +266,26 @@ Clinch, Paradox, custom portals) are not supported. Some Workday boards
 list bare site names ("Lincoln") with no state, so those jobs show under
 `(not given)` with the site name as city.
 
+## Changing the code
+
+Every module, class and function has a docstring saying what it does, what it takes and
+returns, and what to touch to change it. Read them in the source, or with
+`.\.venv\Scripts\python -m pydoc ats_clients` (any module name). [ARCHITECTURE.md](ARCHITECTURE.md)
+shows how the pieces fit together.
+
+| To change | Look at |
+|---|---|
+| how careers links / pages are scored | weights at the top of `find_careers.py`; `score_link()`, `analyze_page()` |
+| which job-board platforms are recognised | `ATS_PATTERNS` in `find_careers.py` |
+| support a new job-board platform | subclass `ATSClient` in `ats_clients.py`, add it to `CLIENTS` (see the `ATSClient` docstring) |
+| US / state detection | `parse_location()` in `classify.py` |
+| education, experience and career-level rules | regexes and `TITLE_RULES` in `classify.py` |
+| salary and the other posting details | `job_details.py` |
+| a new field on each job | `Job` in `ats_clients.py` (the database adds the column itself; add it to `job_cols` in `fetch_jobs.write_outputs()` for jobs.csv) |
+| when jobs are marked closed | `database.save_run()` |
+
+Run `python test.py` after a change; add a case to the matching `test_*.py` file for new rules.
+
 ## Testing
 
 ### Python: `test.py`

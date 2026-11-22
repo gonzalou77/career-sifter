@@ -82,6 +82,13 @@ _DASH_FMT_RE = re.compile(r"^(?:US|USA|United States(?: of America)?)\s*-\s*([^-
 
 @dataclass
 class LocationInfo:
+    """What parse_location() learned from one location string.
+
+    is_us: True, False, or None when it can't tell ("Remote", "3 Locations").
+    states: US state codes named (only when is_us is True).
+    city: the city / site part, when recognisable.
+    remote: the text says remote / virtual / home-based.
+    """
     is_us: bool | None          # None = can't tell (e.g. "Remote", "3 Locations")
     states: list[str] = field(default_factory=list)
     city: str = ""
@@ -89,6 +96,9 @@ class LocationInfo:
 
 
 def state_abbr(name: str) -> str:
+    """Return the two-letter code for a US state given as a code or a full name
+    ("ma", "Massachusetts" -> "MA"); "" if it isn't a US state.
+    """
     name = (name or "").strip()
     if name.upper() in STATE_ABBRS:
         return name.upper()
@@ -99,10 +109,24 @@ def state_abbr(name: str) -> str:
 
 
 def is_us_country(country: str) -> bool:
+    """True if a country field names the United States ("US", "USA", "United States", ...)."""
     return (country or "").strip().lower() in US_COUNTRY_NAMES
 
 
 def parse_location(text: str) -> LocationInfo:
+    """Decide whether a free-text job location is in the US, and which states and city it names.
+
+    Handles the formats job boards use: "Boston, MA", "Boston, MA 02110", "US-MA-Boston",
+    "USA - NY - New York", "US, Houston TX", full state names, "Washington, DC", and
+    "Remote - US". Evidence is weighed rather than trusted blindly: state abbreviations
+    alone are weak ("Bangalore, IN" is India, "Mississauga, CA" is Canada, via
+    _FOREIGN_CITIES_BY_CODE), and a full state name is removed before looking for foreign
+    countries so "New Mexico" isn't read as Mexico.
+
+    Returns a LocationInfo; is_us is None when the text gives no country evidence.
+    To support a new format, add a regex to _STATE_ABBR_RES (or a country to
+    _NON_US_RE / _NON_US_CODE_RE) and a case to test_classify.py.
+    """
     text = (text or "").strip()
     info = LocationInfo(is_us=None, remote=bool(_REMOTE_RE.search(text)))
     if not text:
@@ -154,6 +178,9 @@ _STATE_AFTER_CITY = r"\s*,\s*(" + "|".join(sorted(STATE_ABBRS)) + "|" + \
 
 
 def _city_key(city: str) -> str:
+    """Normalised city name used to match the same site across postings
+    ("Tarrytown - Building 5" -> "tarrytown").
+    """
     return re.sub(r"[^a-z ]", "", city.split(" - ")[0].lower()).strip()
 
 
@@ -229,6 +256,7 @@ _ABBR_DEGREE_PHRASE_RE = re.compile(
 
 
 def _normalise(text: str) -> str:
+    """Replace curly apostrophes and non-breaking spaces so the regexes see plain text."""
     return (text or "").replace("’", "'").replace("\xa0", " ")
 
 
@@ -265,6 +293,10 @@ _YEARS_RE = re.compile(
 
 
 def min_years_experience(text: str) -> int | None:
+    """Smallest "N years of experience" figure in the text ("3-5 years", "at least 2 years
+    of relevant experience", "5+ years"), or None if there is none. Figures above 30 are
+    ignored (company history, not a requirement); "1.5 years" counts as 1.
+    """
     years = [int(float(m.group(1))) for m in _YEARS_RE.finditer(_normalise(text))]
     years = [y for y in years if y <= 30]
     return min(years) if years else None
@@ -317,6 +349,10 @@ _EARLY_DESC_RE = re.compile(r"\b(entry[- ]level|early[- ]career|recent (?:colleg
 
 
 def level_from_label(label: str) -> str:
+    """Career level from a job board's own level label (SmartRecruiters experienceLevel,
+    Phenom jobLevel, Attrax "Experience Level", Oracle JobLevel), or "" if unrecognised.
+    _LABEL_RULES is checked top to bottom, so "Senior Manager" is senior, not mid.
+    """
     for lvl, rx in _LABEL_RULES_RE:
         if rx.search(label or ""):
             return lvl
@@ -324,6 +360,11 @@ def level_from_label(label: str) -> str:
 
 
 def level_from_title(title: str) -> str:
+    """Career level from the job title using TITLE_RULES (first match wins), or "".
+
+    Roman / arabic level numerals ("Scientist II", "Engineer 3", "Level 4") map through
+    _NUMERAL_LEVEL. Rule order matters; see the comment above TITLE_RULES.
+    """
     title = _normalise(title)
     for lvl, rx in _TITLE_RULES_RE:
         m = rx.search(title)
@@ -336,6 +377,9 @@ def level_from_title(title: str) -> str:
 
 
 def level_from_years(years: int | None) -> str:
+    """Career level from minimum years of experience: 0-2 early, 3-6 mid, 7-12 senior,
+    13+ executive; "" when no figure was found.
+    """
     if years is None:
         return ""
     if years <= 2:

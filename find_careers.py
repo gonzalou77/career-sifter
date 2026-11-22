@@ -171,6 +171,9 @@ JOBPOSTING_RE = re.compile(r'"@type"\s*:\s*\[?\s*"JobPosting"', re.I)
 
 @dataclass
 class Page:
+    """A fetched web page: final URL after redirects, HTTP status, HTML ("" for non-HTML
+    responses) and a rough count of <a> tags (few links suggests a JavaScript-built page).
+    """
     url: str
     status: int
     html: str = ""
@@ -178,11 +181,15 @@ class Page:
 
     @property
     def ok(self) -> bool:
+        """True when the page loaded (HTTP 200) and has HTML to look at."""
         return self.status == 200 and bool(self.html)
 
 
 @dataclass
 class Candidate:
+    """A link that might be the careers page: its URL, its score from score_link() (or from
+    analyze_page() for probed pages) and its anchor text / where it came from.
+    """
     url: str
     score: int
     text: str = ""
@@ -190,6 +197,10 @@ class Candidate:
 
 @dataclass
 class PageSignals:
+    """What analyze_page() found on a page: a content score, the ATS detected (name and a
+    link to its board, if any), whether schema.org JobPosting data is present, and the
+    reasons, for the notes column.
+    """
     score: int = 0
     ats: str = ""
     ats_url: str = ""
@@ -199,6 +210,10 @@ class PageSignals:
 
 @dataclass
 class Result:
+    """One row of careers_results.csv: how the scan for one input row went. See the
+    README's "Output columns" for each field; fetch_jobs.py reads input_url, company,
+    status, ats, careers_url, listings_url, rejected_requests and manual_check.
+    """
     input_url: str
     company: str = ""
     input_type: str = ""        # homepage | careers_page | job_board: which entry path the scan took
@@ -256,12 +271,14 @@ def manual_check_note(r: Result) -> str:
 # --------------------------------------------------------------------------- #
 
 def norm_text(s: str) -> str:
+    """Lower-case, straighten apostrophes and collapse whitespace, for phrase matching."""
     s = s.lower().replace("’", "'").replace("\xa0", " ")
     return re.sub(r"\s+", " ", s).strip()
 
 
 @lru_cache(maxsize=None)
 def phrase_re(phrase: str) -> re.Pattern:
+    """Cached regex matching ``phrase`` as whole words ("job" won't match inside "jobsite")."""
     return re.compile(r"(?<![a-z])" + re.escape(phrase) + r"(?![a-z])")
 
 
@@ -276,6 +293,10 @@ def url_key(url: str) -> str:
 
 
 def registered_domain(host: str | None) -> str:
+    """The company-level domain of a host: "careers.pfizer.com" -> "pfizer.com",
+    "www.astrazeneca.co.uk" -> "astrazeneca.co.uk" (common two-part country suffixes are
+    kept). A heuristic, not the public-suffix list.
+    """
     host = (host or "").lower().rstrip(".")
     if host.startswith("www."):
         host = host[4:]
@@ -287,6 +308,9 @@ def registered_domain(host: str | None) -> str:
 
 
 def detect_ats(text: str) -> str:
+    """Name of the job-board platform a URL or text points at (first match in ATS_PATTERNS),
+    or "". Add a platform by adding its host pattern to ATS_PATTERNS.
+    """
     text = text.lower()
     for name, rx in _ATS_RE:
         if rx.search(text):
@@ -384,6 +408,15 @@ def board_company_name(board_url: str) -> str:
 
 
 def score_link(text: str, url: str, base_domain: str, phrases: dict[str, int]) -> int:
+    """Score how likely a link is to be the careers / job-listings page (higher is better).
+
+    Adds: link-text phrases (``phrases`` weights), careers-like path segments
+    (PATH_TOKENS), a careers subdomain and pointing at a known ATS. Subtracts: login and
+    employee-only ATS pages, negative words (privacy, news, ...), long teaser text,
+    non-English locale paths, other domains, and on .edu sites student "career center"
+    pages. Excluded hosts (social sites, aggregators) and file links score -100.
+    Weights live at the top of the file; test_pipeline.py checks the ranking.
+    """
     p = urlparse(url)
     host = (p.hostname or "").lower()
     path = unquote(p.path).lower()
@@ -562,6 +595,7 @@ def needs_manual(entry: dict) -> bool:
 
 
 def checked_recently(entry: dict, days: int) -> bool:
+    """True if a saved entry's last_checked date is less than ``days`` days ago."""
     try:
         return (date.today() - date.fromisoformat(entry.get("last_checked", ""))).days < days
     except ValueError:
@@ -586,6 +620,7 @@ def load_known(path: str) -> dict[str, dict]:
 
 
 def save_known(path: str, known: dict[str, dict]) -> None:
+    """Write the saved-sites table (known_sites.csv), sorted by key, columns KNOWN_FIELDS."""
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=KNOWN_FIELDS, extrasaction="ignore")
         w.writeheader()
@@ -631,6 +666,10 @@ def describe_rejection(r: requests.Response) -> str:
 
 
 def make_session() -> requests.Session:
+    """A requests.Session with the honest CareerSifter user agent and up to 2 retries (with
+    back-off) on 429 / 5xx. After the last retry the response itself is returned, so a
+    refusal can be recorded instead of surfacing as a generic RetryError.
+    """
     s = requests.Session()
     s.headers.update({
         "User-Agent": USER_AGENT,
@@ -664,8 +703,30 @@ def _robots_lock(host: str) -> threading.Lock:
 
 
 class SiteScanner:
+    """Finds the careers page and job board for one input row. Create one per row and call
+    scan(); it returns a filled Result and never raises.
+
+    Entry paths (see ARCHITECTURE.md section 2):
+      * saved entry in known_sites.csv -> scan_from_known()
+      * job-board URL -> use_board() (no crawling)
+      * careers page (careers_url given, careers subdomain or path) -> scan_from_careers_page();
+        the homepage is never requested
+      * homepage -> scan_from_homepage(): score links, probe paths, sitemap, verify
+    then, if no ATS was found, probe_ats_boards() guesses board addresses from the domain.
+
+    Every request goes through get()/fetch(), which honour robots.txt (unless
+    --ignore-robots), wait --delay seconds, cache pages and record refusals.
+    """
     def __init__(self, input_url: str, company: str, args: argparse.Namespace, careers_url: str = "",
                  known: dict | None = None):
+        """Args:
+            input_url: the site from the input list (homepage, careers page or job board).
+            company: name from the input, or "" (filled in later where possible).
+            args: the parsed command-line options (timeout, delay, verify, render, ignore_robots).
+            careers_url: careers page given in the input's careers_url column; wins over a
+                saved entry and means the homepage is never requested.
+            known: this company's saved row from known_sites.csv, or None.
+        """
         self.args = args
         self.session = make_session()
         self.result = Result(input_url=input_url, company=company)
@@ -683,6 +744,7 @@ class SiteScanner:
         self.home_key = ""
 
     def note_rejection(self, r: requests.Response) -> None:
+        """Record the response as a refusal ("host 403 Cloudflare") if it is one."""
         label = describe_rejection(r)
         if label:
             self.rejections.setdefault(f"{urlparse(r.url).netloc} {label}", r.url)
@@ -704,6 +766,9 @@ class SiteScanner:
         return self.robots[host]
 
     def _fetch_robots(self, host: str) -> tuple[robotparser.RobotFileParser | None, int]:
+        """Download and parse host + "/robots.txt" (RFC 9309: 200 parse, 5xx disallow all,
+        other statuses allow all). Returns (parser or None if unreachable, 5xx status or 0).
+        """
         rp, err = None, 0
         try:
             # not recorded as a rejection: real blocks show up on the page request itself,
@@ -723,12 +788,19 @@ class SiteScanner:
         return rp, err
 
     def allowed(self, url: str) -> bool:
+        """True if robots.txt lets our agent fetch url (always True with --ignore-robots)."""
         if self.args.ignore_robots:
             return True
         rp = self._robots_for(url)
         return rp is None or rp.can_fetch(ROBOTS_AGENT, url)
 
     def get(self, url: str, record_rejection: bool = True) -> requests.Response | None:
+        """GET url with robots.txt check, politeness delay and refusal tracking.
+
+        Returns the response (any status), or None if robots.txt disallows it or the request
+        failed. With record_rejection=False (guessed ATS addresses) neither refusals nor
+        robots.txt skips are recorded, since a guess being refused means nothing.
+        """
         if not self.allowed(url):
             if record_rejection:  # stay quiet about guessed addresses
                 p = urlparse(url)
@@ -749,6 +821,11 @@ class SiteScanner:
         return r
 
     def fetch(self, url: str) -> Page | None:
+        """GET url as a Page, cached per scanner (also under the final URL after redirects).
+
+        Returns None if robots.txt disallowed it or the request failed; otherwise a Page
+        whose ``ok`` says whether it loaded. Non-HTML responses get empty html.
+        """
         # exact key (keeps scheme and www.) so a failed bare domain doesn't mask its www. variant
         k = urldefrag(url)[0].rstrip("/")
         if k in self.cache:
@@ -799,6 +876,12 @@ class SiteScanner:
     # ---- discovery steps -------------------------------------------------- #
 
     def load_home(self) -> Page | None:
+        """Load the homepage, trying the URL as given, then www., then http://.
+
+        If none work and the input is a bare domain, starts from careers.<domain> or
+        jobs.<domain> instead (or their search pages), then tries --render. Returns None,
+        with a note, if nothing loads.
+        """
         raw = self.result.input_url.strip()
         if not re.match(r"^https?://", raw, re.I):
             raw = "https://" + raw
@@ -873,6 +956,10 @@ class SiteScanner:
         return None
 
     def probe_paths(self, home: Page) -> list[Candidate]:
+        """When the homepage has no careers link: try COMMON_PATHS (/careers, /jobs, ...) and
+        the careers. / jobs. subdomains, returning the first page that looks like a careers
+        page (analyze_page score >= MIN_PAGE_SCORE) as a one-item candidate list.
+        """
         p = urlparse(home.url)
         root = f"{p.scheme}://{p.netloc}"
         urls = [root + path for path in COMMON_PATHS]
@@ -889,6 +976,9 @@ class SiteScanner:
         return found
 
     def from_sitemap(self, home: Page) -> list[Candidate]:
+        """Last resort: read up to 6 sitemaps (from robots.txt, else /sitemap.xml) and score
+        their URLs as links. Returns candidates, best and shallowest first.
+        """
         p = urlparse(home.url)
         root = f"{p.scheme}://{p.netloc}"
         rp = None if self.args.ignore_robots else self.robots.get(root)
@@ -1030,6 +1120,9 @@ class SiteScanner:
         return None
 
     def post_json(self, url: str, body: dict) -> requests.Response | None:
+        """POST a JSON body (robots.txt checked, delay applied, redirects not followed).
+        Returns the response, or None if disallowed or failed. Used for Workday probes.
+        """
         if not self.allowed(url):
             return None
         time.sleep(self.args.delay)
@@ -1064,6 +1157,13 @@ class SiteScanner:
         return None
 
     def scan(self) -> Result:
+        """Run the scan for this row and return the filled Result. Never raises.
+
+        After the entry path, guesses job-board addresses if no ATS was found (only from the
+        company's own domain), then fills rejected_requests, notes, the request count and the
+        manual_check note. For a blocked / error result the note explains why: robots.txt if
+        it blocked the entry page, else the careers page that couldn't be loaded.
+        """
         try:
             self._scan()
             # guess board addresses only from a company's own domain: for a pasted or saved job board
@@ -1143,6 +1243,13 @@ class SiteScanner:
                 res.method = f"known+{res.method}"
 
     def scan_from_careers_page(self, url: str) -> None:
+        """Start from a careers page without touching the homepage.
+
+        If the page won't load, try its host's usual search pages (try_search_pages); if those
+        fail too, the row ends blocked / error with a "could not be loaded" note. A careers URL
+        that redirects to the homepage is handed to scan_from_homepage(). Otherwise the page is
+        analysed and followed through to the listings (finish()).
+        """
         res = self.result
         page = self.fetch(url)
         if (page is None or not page.ok) and self.args.render:
@@ -1173,6 +1280,11 @@ class SiteScanner:
         self.finish(page, sig, sig.score, "careers-input")
 
     def scan_from_homepage(self, home: Page | None = None) -> None:
+        """Find the careers page from the homepage: score its links (rendered with --render if
+        the page looks JavaScript-built), else probe common paths, else read the sitemap;
+        then fetch the top candidates (verify()) and follow the best to its listings.
+        ``home`` is a page already loaded (a careers URL that redirected to the homepage).
+        """
         res = self.result
         home = home or self.load_home()
         if home is None:
@@ -1233,6 +1345,10 @@ class SiteScanner:
 # --------------------------------------------------------------------------- #
 
 def main(argv: list[str] | None = None) -> int:
+    """Command-line entry point: load the input list and known_sites.csv, scan every site in
+    parallel (--workers), update known_sites.csv (failures never overwrite a working
+    entry), and write the results CSV. Returns the process exit code.
+    """
     ap = argparse.ArgumentParser(description="Find careers / job-listing pages for a list of websites.")
     ap.add_argument("input", help=".txt (one URL per line) or .csv (with a url/website column)")
     ap.add_argument("-o", "--output", default="careers_results.csv", help="output CSV path")
@@ -1272,6 +1388,12 @@ def main(argv: list[str] | None = None) -> int:
              len(sites), args.workers, n_reuse, args.known or "-")
 
     def run(url: str, name: str, careers: str, key: str) -> Result:
+        """Scan one input row, using its saved entry when there is one.
+
+        A saved entry with no board that was checked within --recheck-days is skipped (0
+        requests) unless its last scan ended in "error". If a saved board / careers page
+        fails, the row is rediscovered from the input URL (source = "rediscovered").
+        """
         # an explicit careers_url in the input wins over a saved entry
         entry = None if (careers or args.refresh) else known.get(key)
         if entry and needs_manual(entry):

@@ -6,7 +6,9 @@ records via list_jobs(). Listing calls are cheap and usually carry location;
 enrich() fetches one job's full description (and anything else the listing lacked).
 
 These are the same public JSON endpoints each company's careers page calls from the
-browser. Supported: Workday, Greenhouse, Lever, Ashby, SmartRecruiters, Eightfold, Phenom.
+browser. Supported: Workday, Greenhouse, Lever, Ashby, SmartRecruiters, Eightfold, Phenom,
+iCIMS, Attrax, Oracle Recruiting Cloud and PeopleAdmin (see CLIENTS at the bottom).
+To add a platform, see the ATSClient docstring.
 """
 from __future__ import annotations
 
@@ -31,6 +33,28 @@ from job_details import extract_salary, salary_fields
 
 @dataclass
 class Job:
+    """One job posting, as collected from a job board and then tagged.
+
+    Fields come in three groups, filled at different stages:
+
+    1. Listing / detail data, set by an ATSClient: ids, title, url, locations, is_us,
+       states, city, remote, department, employment_type, posted, level_raw, description.
+       ``is_us`` is True / False, or None when the location can't be told yet (enrich()
+       usually settles it).
+    2. Classification, set by fetch_jobs.classify_job() using classify.py: education,
+       years of experience, career level and the keywords matched.
+    3. Details, set by job_details.py: salary_* fields, work arrangement, schedule, term,
+       shifts, travel, visa, relocation, bonus, equity, certifications.
+
+    ``meta`` is private scratch space for the client (e.g. the Workday job path that
+    enrich() needs, or salary / arrangement taken from the board's own fields); it is
+    not written to the CSVs or the database.
+
+    To add a field: add it here with a default. database.open_db() adds the column to an
+    existing database automatically (list fields need adding to database.LIST_COLUMNS,
+    numeric ones to FLOAT_COLUMNS / INT_COLUMNS); add it to ``job_cols`` in
+    fetch_jobs.write_outputs() to show it in jobs.csv.
+    """
     company: str
     ats: str
     job_id: str
@@ -78,6 +102,9 @@ class Job:
 
 
 def html_to_text(html: str) -> str:
+    """Turn an HTML fragment (a job description) into plain text, one block per line,
+    with runs of blank lines collapsed. Returns "" for empty input.
+    """
     if not html:
         return ""
     text = BeautifulSoup(html, "html.parser").get_text("\n")
@@ -179,11 +206,45 @@ COMPLETE_FRACTION = 0.95
 
 
 class ATSClient:
+    """Base class for one job-board platform (applicant-tracking system).
+
+    A subclass sets ``name`` (must match the ``ats`` value find_careers.py writes, e.g.
+    "Workday") and implements list_jobs(); it may override enrich() and finalize().
+    fetch_jobs.process_company() drives it:
+
+        client = Cls(board_url, company, session, ...)
+        jobs = client.list_jobs(us_only)    # cheap listing calls
+        client.enrich(job)                  # per job, in threads, only if a description is missing
+        client.finalize(jobs)               # fix-ups that need the whole set
+
+    All HTTP goes through get()/post(), which check robots.txt (raising RobotsDisallowed),
+    wait ``delay`` seconds, count refusals in ``rejections`` and raise for HTTP errors.
+    Set ``total_openings`` (all locations), ``us_filtered`` (True if the board itself
+    filtered to the US) and ``expected_listed`` (the board's own total for the query, so
+    listing_complete() can spot a cut-short listing) in list_jobs().
+
+    To add a platform: subclass, implement list_jobs() (and enrich() if the listing has no
+    description), add the class to CLIENTS at the bottom of this file, and add its URL
+    pattern to ATS_PATTERNS in find_careers.py so boards get detected.
+    """
     name = ""
 
     def __init__(self, board_url: str, company: str, session: requests.Session,
                  delay: float = 0.5, timeout: float = 20, company_domain: str = "",
                  respect_robots: bool = True):
+        """Args:
+            board_url: the job-board URL find_careers.py found (listings_url).
+            company: display name copied onto every Job.
+            session: a requests.Session (find_careers.make_session(): honest user agent, retries).
+            delay: seconds to wait before every request (politeness; per thread).
+            timeout: per-request timeout in seconds.
+            company_domain: the company's own domain (e.g. corteva.com), needed by Eightfold;
+                "" when the input was a pasted board.
+            respect_robots: check robots.txt before each request (False with --ignore-robots).
+
+        Subclasses parse ``board_url`` in their own __init__ and raise ValueError if it lacks
+        what they need (site name, board token, ...).
+        """
         self.board_url = board_url
         self.company = company
         self.session = session
@@ -200,6 +261,11 @@ class ATSClient:
         self.expected_listed: int | None = None
 
     def _check_robots(self, url: str) -> None:
+        """Raise RobotsDisallowed if robots.txt on url's host disallows it for our agent.
+
+        robots.txt is fetched once per host per run and shared by all clients and threads
+        (module-level _ROBOTS_CACHE, one lock per host). Does nothing when respect_robots is off.
+        """
         if not self.respect_robots:
             return
         p = urlparse(url)
@@ -215,6 +281,12 @@ class ATSClient:
             raise RobotsDisallowed(f"robots.txt on {p.netloc} disallows {p.path}")
 
     def _fetch_robots(self, root: str) -> robotparser.RobotFileParser | None:
+        """Download and parse root + "/robots.txt".
+
+        Follows RFC 9309: 200 -> parse the rules; 5xx -> treat everything as disallowed; any
+        other status (404, 403, ...) -> everything allowed. Returns None when the host can't be
+        reached at all, which _check_robots() treats as allowed.
+        """
         try:
             r = self.session.get(root + "/robots.txt", timeout=self.timeout)
         except requests.RequestException:
@@ -233,6 +305,12 @@ class ATSClient:
         return self.expected_listed is None or n_listed >= COMPLETE_FRACTION * self.expected_listed
 
     def _request(self, method: str, url: str, **kw) -> requests.Response:
+        """Make one HTTP request: robots.txt check, politeness delay, refusal bookkeeping.
+
+        A refusal (403 from Cloudflare, 429, ...; see find_careers.describe_rejection) is counted
+        in ``self.rejections`` under "host status vendor" so the summary can report it. Raises
+        RobotsDisallowed, requests.HTTPError for 4xx/5xx, or requests.RequestException.
+        """
         self._check_robots(url)
         time.sleep(self.delay)
         headers = {"Accept": "application/json, text/html;q=0.9", **kw.pop("headers", {})}
@@ -245,12 +323,24 @@ class ATSClient:
         return r
 
     def get(self, url: str, **kw) -> requests.Response:
+        """GET url through _request() (robots.txt, delay, refusal tracking, raise on error)."""
         return self._request("GET", url, **kw)
 
     def post(self, url: str, **kw) -> requests.Response:
+        """POST url through _request() (robots.txt, delay, refusal tracking, raise on error)."""
         return self._request("POST", url, **kw)
 
     def list_jobs(self, us_only: bool = True) -> list[Job]:
+        """Return every job on the board as Job records (subclasses must implement).
+
+        Args:
+            us_only: the caller only wants US jobs. Boards with a server-side country filter
+                (Workday) use it and set ``us_filtered``; others return everything and leave
+                is_us for fetch_jobs to filter on.
+
+        Should set ``total_openings`` and, when the board reports its own total,
+        ``expected_listed``. Raise on failure; fetch_jobs records it as blocked / error.
+        """
         raise NotImplementedError
 
     def enrich(self, job: Job) -> None:
@@ -260,20 +350,37 @@ class ATSClient:
         """Hook run after enrich() on all jobs, for fix-ups that need the whole set."""
 
     def _job(self, job_id, title, **kw) -> Job:
+        """Create a Job pre-filled with this client's company and ATS name.
+
+        ``job_id`` is stored as a string (it is part of the database key), the title is
+        stripped, and any other Job field can be passed as a keyword.
+        """
         return Job(company=self.company, ats=self.name, job_id=str(job_id), title=(title or "").strip(), **kw)
 
     @staticmethod
     def _segments(url: str) -> list[str]:
+        """Non-empty path segments of url: "https://x.com/en-US/Site/" -> ["en-US", "Site"]."""
         return [s for s in urlparse(url).path.split("/") if s]
 
 
 # --------------------------------------------------------------------------- #
 
 class WorkdayClient(ATSClient):
+    """Workday boards (<tenant>.wdN.myworkdayjobs.com/<Site>), read through the JSON API the
+    board's own page uses: POST /wday/cxs/<tenant>/<Site>/jobs (20 jobs per page) and
+    GET /wday/cxs/<tenant>/<Site><externalPath> for one job's details.
+
+    With us_only, the board's own country facet is applied, so only US jobs are listed
+    (``us_filtered``). finalize() uses the state facet to place jobs whose location is
+    a bare site name ("Lincoln") in a state.
+    """
     name = "Workday"
     PAGE = 20  # Workday's maximum page size
 
     def __init__(self, *a, **kw):
+        """Parse the tenant and site name from the board URL (an optional locale segment such
+        as /en-US/ is skipped). Raises ValueError if the URL has no site name.
+        """
         super().__init__(*a, **kw)
         p = urlparse(self.board_url)
         segs = self._segments(self.board_url)
@@ -287,6 +394,9 @@ class WorkdayClient(ATSClient):
         self.web = f"https://{p.netloc}/en-US/{self.site}"
 
     def _page(self, offset: int, facets: dict) -> dict:
+        """Fetch one page (``PAGE`` jobs from ``offset``) of the listing with the given facets
+        applied, e.g. {"locationCountry": ["<US facet id>"]}. Returns the raw JSON.
+        """
         body = {"appliedFacets": facets, "limit": self.PAGE, "offset": offset, "searchText": ""}
         return self.post(self.api + "/jobs", json=body).json()
 
@@ -302,12 +412,21 @@ class WorkdayClient(ATSClient):
                     yield param, v
 
     def _us_facet(self, facets: list) -> tuple[str, str] | tuple[None, None]:
+        """Find the country facet value for the United States in a listing's facets.
+
+        Returns (facetParameter, value id), or (None, None) if the board has no country facet.
+        """
         for param, v in self._walk_facets(facets):
             if "country" in param.lower() and is_us_country(v.get("descriptor", "")):
                 return param, v["id"]
         return None, None
 
     def _all_postings(self, facets: dict, first: dict | None = None) -> list[dict]:
+        """Page through the whole listing for the given facets and return the raw postings.
+
+        Workday only reports ``total`` reliably on the first page, so that number drives the
+        loop; it also stops at the first empty page. ``first`` is an already-fetched page 0.
+        """
         data = first or self._page(0, facets)
         total = data.get("total", 0)
         postings = list(data.get("jobPostings", []))
@@ -319,6 +438,12 @@ class WorkdayClient(ATSClient):
         return postings
 
     def list_jobs(self, us_only=True):
+        """List all jobs (US only when the board has a country facet and us_only is set).
+
+        ``total_openings`` is the unfiltered worldwide total; ``expected_listed`` is the total
+        for the query actually made. A job's id is its first bullet field (the requisition id),
+        falling back to its path. "N Locations" listing text is left for enrich() to resolve.
+        """
         first = self._page(0, {})
         self.total_openings = first.get("total", 0)
         self.facets, self.facet_data = {}, first
@@ -344,6 +469,10 @@ class WorkdayClient(ATSClient):
         return jobs
 
     def enrich(self, job):
+        """Fetch one job's detail record: description, public URL, time type (full/part time),
+        start date and all its locations. The primary country is only applied to the first
+        location; additional locations are judged from their own text.
+        """
         info = self.get(self.api + job.meta["path"]).json().get("jobPostingInfo", {})
         job.description = html_to_text(info.get("jobDescription", ""))
         job.url = info.get("externalUrl") or job.url
@@ -374,9 +503,17 @@ class WorkdayClient(ATSClient):
 
 
 class GreenhouseClient(ATSClient):
+    """Greenhouse boards (boards.greenhouse.io/<token>, job-boards.greenhouse.io/<token>, or an
+    embed URL with ?for=<token>), read from the public board API in one request:
+    GET boards-api.greenhouse.io/v1/boards/<token>/jobs?content=true, which already includes
+    each job's description, so no enrich() is needed.
+    """
     name = "Greenhouse"
 
     def __init__(self, *a, **kw):
+        """Take the board token from ?for=<token> (embed URLs) or the first path segment.
+        Raises ValueError if neither is present.
+        """
         super().__init__(*a, **kw)
         q = parse_qs(urlparse(self.board_url).query)
         segs = self._segments(self.board_url)
@@ -385,6 +522,9 @@ class GreenhouseClient(ATSClient):
             raise ValueError(f"no Greenhouse board token in {self.board_url}")
 
     def list_jobs(self, us_only=True):
+        """List every job with its description, departments and office locations.
+        Greenhouse has no country filter, so ``us_only`` is ignored here.
+        """
         data = self.get(f"https://boards-api.greenhouse.io/v1/boards/{self.token}/jobs",
                         params={"content": "true"}).json()
         jobs = []
@@ -402,9 +542,16 @@ class GreenhouseClient(ATSClient):
 
 
 class LeverClient(ATSClient):
+    """Lever boards (jobs.lever.co/<company>, or jobs.eu.lever.co for EU-hosted accounts), read
+    from the public postings API in one request: GET api.lever.co/v0/postings/<company>?mode=json.
+    Descriptions, workplace type and the salary range are all in the listing.
+    """
     name = "Lever"
 
     def __init__(self, *a, **kw):
+        """Take the company slug from the first path segment and pick the EU or US API host.
+        Raises ValueError if the URL has no slug.
+        """
         super().__init__(*a, **kw)
         segs = self._segments(self.board_url)
         if not segs:
@@ -413,6 +560,10 @@ class LeverClient(ATSClient):
         self.api = "https://api.eu.lever.co" if ".eu." in urlparse(self.board_url).netloc else "https://api.lever.co"
 
     def list_jobs(self, us_only=True):
+        """List every job. The description is assembled from the plain-text intro, each list
+        section (heading plus items) and the closing text. Lever's salaryRange and
+        workplaceType are kept in meta so they win over anything read from the text.
+        """
         data = self.get(f"{self.api}/v0/postings/{self.slug}", params={"mode": "json"}).json()
         jobs = []
         for j in data:
@@ -440,9 +591,14 @@ class LeverClient(ATSClient):
 
 
 class AshbyClient(ATSClient):
+    """Ashby boards (jobs.ashbyhq.com/<org>), read from the public posting API in one request:
+    GET api.ashbyhq.com/posting-api/job-board/<org>?includeCompensation=true. The listing has
+    descriptions, structured addresses and compensation, so no enrich() is needed.
+    """
     name = "Ashby"
 
     def __init__(self, *a, **kw):
+        """Take the organisation slug from the first path segment. Raises ValueError if missing."""
         super().__init__(*a, **kw)
         segs = self._segments(self.board_url)
         if not segs:
@@ -450,6 +606,10 @@ class AshbyClient(ATSClient):
         self.org = segs[0]
 
     def list_jobs(self, us_only=True):
+        """List every listed job (``isListed`` False ones are skipped). Locations use the
+        structured postal addresses (country, region, city) of the primary and secondary
+        locations; the first "Salary" compensation component becomes the job's salary.
+        """
         data = self.get(f"https://api.ashbyhq.com/posting-api/job-board/{self.org}",
                         params={"includeCompensation": "true"}).json()
         jobs = []
@@ -480,9 +640,19 @@ class AshbyClient(ATSClient):
 
 
 class SmartRecruitersClient(ATSClient):
+    """SmartRecruiters boards (jobs.smartrecruiters.com/<Company>), read from the public postings
+    API: GET api.smartrecruiters.com/v1/companies/<Company>/postings (100 per page) and
+    .../postings/<id> for details.
+
+    Note: SmartRecruiters' robots.txt disallows this API, so by default the company is
+    reported as robots_disallowed and nothing is collected (see --ignore-robots).
+    """
     name = "SmartRecruiters"
 
     def __init__(self, *a, **kw):
+        """Take the company id from the URL; an employee SSO link (/web-sso/saml/<Company>/...)
+        also works. Raises ValueError if no company id is found.
+        """
         super().__init__(*a, **kw)
         segs = self._segments(self.board_url)
         if segs[:2] == ["web-sso", "saml"] and len(segs) > 2:  # employee SSO link: /web-sso/saml/<Company>/login
@@ -493,6 +663,9 @@ class SmartRecruitersClient(ATSClient):
         self.api = f"https://api.smartrecruiters.com/v1/companies/{self.cid}/postings"
 
     def list_jobs(self, us_only=True):
+        """Page through all postings. The board's experienceLevel label is kept in level_raw
+        (used for career level when the title says nothing).
+        """
         jobs, offset, total = [], 0, None
         while total is None or offset < total:
             data = self.get(self.api, params={"limit": 100, "offset": offset}).json()
@@ -518,6 +691,7 @@ class SmartRecruitersClient(ATSClient):
         return jobs
 
     def enrich(self, job):
+        """Fetch one posting and join the text of its job-ad sections into the description."""
         d = self.get(f"{self.api}/{job.job_id}").json()
         sections = ((d.get("jobAd") or {}).get("sections") or {}).values()
         job.description = "\n".join(html_to_text(s.get("text", "")) for s in sections if isinstance(s, dict))
@@ -525,9 +699,19 @@ class SmartRecruitersClient(ATSClient):
 
 
 class EightfoldClient(ATSClient):
+    """Eightfold career sites (<company>.eightfold.ai/careers?domain=<company domain>), read from
+    the site's JSON API: /api/pcsx/search (paged by ``start``) and /api/pcsx/position_details.
+
+    The API needs the company's domain, taken from ?domain= in the board URL or from
+    ``company_domain``. Note: Eightfold's robots.txt disallows /api/, so by default these
+    companies are reported as robots_disallowed.
+    """
     name = "Eightfold"
 
     def __init__(self, *a, **kw):
+        """Read the host and the company domain (?domain=, else company_domain).
+        Raises ValueError if no domain is available.
+        """
         super().__init__(*a, **kw)
         p = urlparse(self.board_url)
         self.host = p.netloc
@@ -536,6 +720,10 @@ class EightfoldClient(ATSClient):
             raise ValueError("Eightfold needs the company domain")
 
     def list_jobs(self, us_only=True):
+        """Page through all positions. Countries come from standardizedLocations
+        ("Iowa,US" -> "US"); a job whose standardized locations name no US place is marked
+        non-US rather than unknown.
+        """
         jobs, start, total = [], 0, None
         while total is None or start < total:
             data = self.get(f"https://{self.host}/api/pcsx/search",
@@ -564,6 +752,7 @@ class EightfoldClient(ATSClient):
         return jobs
 
     def enrich(self, job):
+        """Fetch one position's details: description and public URL."""
         d = self.get(f"https://{self.host}/api/pcsx/position_details",
                      params={"position_id": job.job_id, "domain": self.domain, "hl": "en"}
                      ).json().get("data") or {}
@@ -577,6 +766,9 @@ class PhenomClient(ATSClient):
     DDO_RE = re.compile(r"phApp\.ddo\s*=\s*(\{.*?\});\s*phApp\.", re.S)
 
     def __init__(self, *a, **kw):
+        """Work out the site's /<country>/<lang> base (e.g. careers.gene.com/us/en); defaults
+        to /us/en when the board URL doesn't include one.
+        """
         super().__init__(*a, **kw)
         p = urlparse(self.board_url)
         segs = self._segments(self.board_url)
@@ -585,12 +777,18 @@ class PhenomClient(ATSClient):
         self.base = f"{p.scheme}://{p.netloc}/" + "/".join(locale)
 
     def _ddo(self, url: str) -> dict:
+        """Fetch a Phenom page and return its embedded ``phApp.ddo`` JSON (the data the page's
+        own JavaScript renders from). Raises ValueError if the page has none.
+        """
         m = self.DDO_RE.search(self.get(url, headers={"Accept": "text/html"}).text)
         if not m:
             raise ValueError(f"no Phenom data on {url}")
         return json.loads(m.group(1))
 
     def list_jobs(self, us_only=True):
+        """Page through /search-results?from=N, reading the jobs and the total from the
+        embedded data. The site's jobLevel label goes into level_raw.
+        """
         jobs, start, total = [], 0, None
         while total is None or start < total:
             rs = self._ddo(f"{self.base}/search-results?from={start}&s=1").get("eagerLoadRefineSearch") or {}
@@ -611,6 +809,9 @@ class PhenomClient(ATSClient):
         return jobs
 
     def enrich(self, job):
+        """Fetch one job page and take the description (and job level, if given) from its
+        embedded data.
+        """
         jd = (((self._ddo(job.url).get("jobDetail") or {}).get("data") or {}).get("job") or {})
         job.description = html_to_text(jd.get("description", ""))
         job.level_raw = jd.get("jobLevel") or job.level_raw
@@ -630,6 +831,9 @@ class ICIMSClient(ATSClient):
     ROW_LOC_RE = re.compile(r"^([A-Z]{2})-(?:([A-Z]{2})-)?(.*)$")  # "US-GA-Norcross", "ES-Barcelona"
 
     def __init__(self, *a, **kw):
+        """Pick the mode from the host: *.icims.com is a classic portal, anything else an
+        iCIMS career site with a JSON API.
+        """
         super().__init__(*a, **kw)
         p = urlparse(self.board_url)
         self.host = p.netloc
@@ -637,10 +841,14 @@ class ICIMSClient(ATSClient):
         self.base = f"https://{self.host}"
 
     def _search_page(self, page: int) -> str:
+        """Fetch page ``page`` (0-based) of a classic portal's job search, in its iframe form."""
         return self.get(f"{self.base}/jobs/search", params={"ss": 1, "in_iframe": 1, "pr": page},
                         headers={"Accept": "text/html"}).text
 
     def list_jobs(self, us_only=True):
+        """List jobs in whichever mode applies. A classic portal whose search page redirects
+        (window.top.location) to a career site on another domain is switched to site mode.
+        """
         if self.mode == "classic":
             first = self._search_page(0)
             m = self.REDIRECT_RE.search(first)
@@ -654,6 +862,11 @@ class ICIMSClient(ATSClient):
     # ---- classic portal ---------------------------------------------------- #
 
     def _list_classic(self, first_html: str) -> list[Job]:
+        """Read every search page of a classic portal and turn each table row into a Job.
+
+        The page count comes from "Page X of N", else from the highest pr= link. Locations are
+        the row's "US-ST-City" codes. Descriptions need enrich() (one request per job).
+        """
         pages = [first_html]
         m = re.search(r"Page\s+\d+\s+of\s+(\d+)", BeautifulSoup(first_html, "html.parser").get_text(" "))
         n_pages = int(m.group(1)) if m else 1 + max(map(int, re.findall(r"[?&;]pr=(\d+)", first_html)), default=0)
@@ -693,6 +906,10 @@ class ICIMSClient(ATSClient):
     # ---- career site API --------------------------------------------------- #
 
     def _list_site(self) -> list[Job]:
+        """Page through a career site's /api/jobs feed (100 per page). Descriptions,
+        responsibilities and qualifications are included, so no detail requests are needed.
+        Stops when a page brings no job not already seen.
+        """
         jobs, seen, page, total = [], set(), 1, None
         while total is None or len(seen) < total:
             data = self.get(f"{self.base}/api/jobs", params={"page": page, "limit": 100}).json()
@@ -724,6 +941,9 @@ class ICIMSClient(ATSClient):
     # ---- detail (classic only; the API already includes descriptions) ------ #
 
     def enrich(self, job):
+        """Fetch a classic portal's job page and fill the job from its schema.org JobPosting
+        data (description, type, date, location, salary), falling back to the visible job text.
+        """
         html = self.get(job.url, params={"in_iframe": 1}, headers={"Accept": "text/html"}).text
         data = jobposting_ld(html)
         if data:
@@ -742,6 +962,7 @@ class AttraxClient(ATSClient):
     TOTAL_RE = re.compile(r"([\d,]+)\s+result\(s\)", re.I)
 
     def __init__(self, *a, **kw):
+        """Keep the site origin and its language prefix (e.g. /en), from which /jobs is read."""
         super().__init__(*a, **kw)
         p = urlparse(self.board_url)
         segs = self._segments(self.board_url)
@@ -750,10 +971,14 @@ class AttraxClient(ATSClient):
         self.base = self.origin + (f"/{locale}" if locale else "")
 
     def _html(self, url: str, **kw) -> str:
+        """GET a page as HTML, decoded as UTF-8 (Attrax labels pages ISO-8859-1 but serves UTF-8)."""
         # Attrax labels pages ISO-8859-1 but serves UTF-8
         return self.get(url, headers={"Accept": "text/html"}, **kw).content.decode("utf-8", "replace")
 
     def list_jobs(self, us_only=True):
+        """Page through /<lang>/jobs (``PAGE_SIZE`` tiles per page) until every job the site's
+        "N result(s)" count promised has been seen, or a page brings nothing new.
+        """
         jobs, seen, page, total = [], set(), 1, None
         while total is None or len(seen) < total:
             html = self._html(f"{self.base}/jobs", params={"page": page, "size": self.PAGE_SIZE})
@@ -773,6 +998,10 @@ class AttraxClient(ATSClient):
         return jobs
 
     def _tile(self, tile) -> Job:
+        """Turn one job tile into a Job. Tiles carry labelled fields (Location, Function, Job
+        Type, Experience Level, Work location type, Salary); the US is recognised from the
+        tile's country CSS class. A salary on the tile counts as the job board's own.
+        """
         a = tile.select_one("a.attrax-vacancy-tile__title")
         fields: dict[str, list[str]] = {}
         for label in tile.select(".attrax-vacancy-tile__item-label"):
@@ -794,6 +1023,9 @@ class AttraxClient(ATSClient):
         return job
 
     def enrich(self, job):
+        """Fetch the job page and fill the job from its schema.org JobPosting data, falling
+        back to the visible description block.
+        """
         html = self._html(job.url)
         data = jobposting_ld(html)
         if data:
@@ -810,6 +1042,9 @@ class OracleClient(ATSClient):
     PAGE = 100
 
     def __init__(self, *a, **kw):
+        """Read the host, site number (/sites/<id>) and language from the board URL. The site
+        may be unknown at this point for a vanity domain; _resolve_site() finds it.
+        """
         super().__init__(*a, **kw)
         p = urlparse(self.board_url)
         self.host = p.netloc
@@ -820,6 +1055,10 @@ class OracleClient(ATSClient):
         self.api = f"https://{self.host}/hcmRestApi/resources/latest"
 
     def _resolve_site(self) -> None:
+        """Find the site number when the board URL didn't contain one: the vanity root
+        redirects to /sites/<id>, or the page mentions siteNumber. Falls back to "CX_1",
+        Oracle's default site.
+        """
         if self.site:
             return
         r = self.get(self.board_url, headers={"Accept": "text/html"})  # vanity root redirects to /sites/<id>
@@ -827,6 +1066,9 @@ class OracleClient(ATSClient):
         self.site = m.group(1) if m else "CX_1"
 
     def list_jobs(self, us_only=True):
+        """Page through recruitingCEJobRequisitions (``PAGE`` per request). Primary and
+        secondary locations, their countries and the workplace type come with the listing.
+        """
         self._resolve_site()
         jobs, offset, total = [], 0, None
         while total is None or offset < total:
@@ -851,6 +1093,9 @@ class OracleClient(ATSClient):
         return jobs
 
     def enrich(self, job):
+        """Fetch one requisition's details: description, responsibilities and qualifications
+        joined into the description, plus job level, category and schedule.
+        """
         url = (f"{self.api}/recruitingCEJobRequisitionDetails?expand=all&onlyData=true"
                f"&finder=ById;Id=%22{job.job_id}%22,siteNumber={self.site}")
         d = (self.get(url).json().get("items") or [{}])[0]
@@ -872,11 +1117,15 @@ class PeopleAdminClient(ATSClient):
     LOCATION_FIELD_RE = re.compile(r"location|campus|city|work site", re.I)
 
     def __init__(self, *a, **kw):
+        """Keep the site origin; the feed and postings live under /postings."""
         super().__init__(*a, **kw)
         p = urlparse(self.board_url)
         self.base = f"{p.scheme}://{p.netloc}"
 
     def list_jobs(self, us_only=True):
+        """Read every posting from the Atom feed. Each job is marked US (PeopleAdmin is a US
+        platform) and ``summary_only``, so fetch_jobs still calls enrich() for the full text.
+        """
         feed = BeautifulSoup(self.get(f"{self.base}/postings/search.atom",
                                       headers={"Accept": "application/atom+xml"}).content, "html.parser")
         jobs = []
@@ -897,6 +1146,9 @@ class PeopleAdminClient(ATSClient):
         return jobs
 
     def enrich(self, job):
+        """Fetch a posting page and turn its field table into the description ("Field: value"
+        lines). Fields named like location / campus / city set the job's location.
+        """
         soup = BeautifulSoup(self.get(job.url, headers={"Accept": "text/html"}).content, "html.parser")
         fields = []
         for tr in soup.select("table tr"):

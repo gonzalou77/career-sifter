@@ -39,10 +39,14 @@ TRACKING_COLUMNS = ["first_seen_run INTEGER", "last_seen_run INTEGER", "first_se
 
 
 def _type(col: str) -> str:
+    """SQLite column type for a Job field: REAL for salaries, INTEGER for counts / flags,
+    TEXT otherwise (lists are stored as joined text).
+    """
     return "REAL" if col in FLOAT_COLUMNS else "INTEGER" if col in INT_COLUMNS else "TEXT"
 
 
 def _now() -> str:
+    """Current UTC time as an ISO-8601 string (seconds), used for every timestamp column."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
@@ -127,6 +131,9 @@ def open_db(path: str) -> sqlite3.Connection:
 
 
 def _value(col: str, v):
+    """Convert a Job field value for storage: lists joined with "; " (locations with " | "),
+    booleans to 0/1, and "" in numeric columns to NULL.
+    """
     if col in LIST_COLUMNS:
         return (" | " if col == "locations" else "; ").join(v or [])
     if isinstance(v, bool):
@@ -137,6 +144,14 @@ def _value(col: str, v):
 
 
 def start_run(conn: sqlite3.Connection, input_file: str, settings: dict, complete: bool, us_only: bool) -> int:
+    """Insert a row into ``runs`` for this fetch_jobs.py run and return its run_id.
+
+    Args:
+        input_file: the careers_results.csv the run read.
+        settings: the command-line options (stored as JSON).
+        complete: no --max-jobs cap, so jobs this run doesn't see may be closed.
+        us_only: only US jobs were collected, so only US jobs may be closed.
+    """
     cur = conn.execute("INSERT INTO runs(started_at, input_file, settings, complete, us_only) VALUES (?,?,?,?,?)",
                        (_now(), input_file, json.dumps(settings, default=str), int(complete), int(us_only)))
     conn.commit()

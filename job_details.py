@@ -47,11 +47,15 @@ _PLAUSIBLE = {"hour": (7, 500), "week": (300, 20_000), "month": (1_000, 200_000)
 
 
 def _amount(num: str, k: str | None) -> float:
+    """Parse an amount like "72,000" or "95" (with "k" meaning thousands) as a float."""
     value = float(num.replace(",", ""))
     return value * 1000 if k else value
 
 
 def _plausible(period: str, low: float, high: float) -> bool:
+    """True if low..high is a believable pay range for the period (e.g. 7-500 an hour,
+    15,000-2,000,000 a year); rules out revenue figures, phone numbers and the like.
+    """
     lo, hi = _PLAUSIBLE.get(period, (0, 0))
     return bool(period) and lo <= low and high <= hi
 
@@ -69,6 +73,7 @@ def _period(after: str, low: float, high: float) -> str:
 
 
 def _currency(symbol: str) -> str:
+    """ISO currency code for a currency symbol / prefix ("C$" -> CAD, "£" -> GBP); "$" is USD."""
     s = symbol.replace(" ", "").upper()
     if s.startswith("C$") or s.startswith("CAD"):
         return "CAD"
@@ -80,6 +85,10 @@ def _currency(symbol: str) -> str:
 
 
 def salary_fields(low: float, high: float, currency: str, period: str, source: str) -> dict:
+    """The Job salary fields for a range: min, max, currency, period, the annual midpoint
+    (hourly x 2080, weekly x 52, monthly x 12) and where it came from ("job board" or
+    "description").
+    """
     mid = (low + high) / 2
     return {"salary_min": low, "salary_max": high, "salary_currency": currency, "salary_period": period,
             "salary_annual_mid": round(mid * _PER_YEAR[period]) if period in _PER_YEAR else None,

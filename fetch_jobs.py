@@ -46,6 +46,14 @@ LEVEL_COLUMNS = {lvl: f"level_{lvl}" for lvl in LEVELS + [LEVEL_UNSPECIFIED]}
 
 @dataclass
 class CompanyReport:
+    """Everything fetch_jobs.py learned about one company (one row of careers_results.csv).
+
+    Becomes one row of summary.csv, its jobs rows of jobs.csv / jobs.jsonl, and one
+    company_snapshots row plus job rows in the database (see database.save_run).
+    ``status`` says whether the openings could be collected; when not, ``manual_check``
+    says what to open by hand. ``jobs`` holds the US jobs (all jobs with
+    --all-locations), fully classified.
+    """
     company: str
     ats: str
     board_url: str
@@ -69,6 +77,9 @@ class CompanyReport:
 
 
 def load_keywords(spec: str | None) -> list[str]:
+    """Parse --keywords: a comma list ("python,CRISPR") or "@file" with one keyword per line
+    (# comments allowed). Returns unique keywords in the order given.
+    """
     if not spec:
         return []
     if spec.startswith("@"):
@@ -80,10 +91,20 @@ def load_keywords(spec: str | None) -> list[str]:
 
 
 def keyword_res(keywords: list[str]) -> dict[str, re.Pattern]:
+    """Compile one case-insensitive regex per keyword that only matches it as a whole token:
+    no letter or digit may touch it on either side, so "R" matches "R, Python" but not
+    "Rust", and "GMP" doesn't match "cGMP2". Special characters ("C++") are escaped.
+    """
     return {k: re.compile(r"(?<![A-Za-z0-9])" + re.escape(k) + r"(?![A-Za-z0-9])", re.I) for k in keywords}
 
 
 def classify_job(job: Job, kw_res: dict[str, re.Pattern]) -> None:
+    """Fill in a job's classification and details from its title and description, in place.
+
+    Education, years of experience, career level (title, then board label, then years,
+    then "entry level" wording), keywords, salary (the board's own pay fields first, else
+    the text), and the job_details.py fields (arrangement, schedule, term, travel, ...).
+    """
     text = job.description
     job.education_mentioned, job.min_education = classify_education(text)
     job.min_years_experience = min_years_experience(text)
@@ -117,6 +138,18 @@ def company_identity(input_url: str) -> tuple[str, str]:
 
 
 def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pattern]) -> CompanyReport:
+    """Collect and classify one company's openings. Never raises: problems become a status.
+
+    Steps: skip rows find_careers.py couldn't use (status not usable / no ATS / unsupported
+    ATS); list the board with the right ATSClient; fetch details for jobs that need them
+    (in ``--detail-workers`` threads, capped by --max-jobs); infer missing states; keep US
+    jobs (unless --all-locations) and classify them.
+
+    Statuses: ok, no_ats, unsupported_ats, robots_disallowed, blocked (the board refused
+    us), error, or the find_careers.py status passed through. The report also records
+    whether the listing looked complete (``listing_complete``) and every listed job id
+    (``listed_ids``), which decide what the database may mark closed.
+    """
     input_url = row.get("input_url", "")
     key, domain = company_identity(input_url)
     company = row.get("company") or domain or key
@@ -181,6 +214,9 @@ def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pa
         targets, beyond_cap = targets[: args.max_jobs], targets[args.max_jobs:]
 
     def enrich(job: Job) -> None:
+        """Fetch one job's details unless its listing already had a full description.
+        A failure is stored on the job (detail_error) rather than raised.
+        """
         if job.description and not job.meta.get("summary_only"):
             return
         try:
@@ -231,6 +267,10 @@ def join_rejections(finder: str, client_counts: Counter | None) -> str:
 def summary_row(name: str, ats: str, status: str, total, us: int, unknown: int, jobs: list[Job],
                 keywords: list[str], board: str = "", notes: str = "", rejected: str = "",
                 manual: str = "") -> dict:
+    """Build one summary.csv row: totals, US share, top states, education / level / pay /
+    arrangement / term counts and keyword counts over the US jobs given. Also used for
+    the "ALL" row with every successful company's jobs combined.
+    """
     us_jobs = [j for j in jobs if j.is_us]
     edu = Counter(j.min_education for j in us_jobs)
     lvl = Counter(j.career_level for j in us_jobs)
@@ -263,6 +303,12 @@ def summary_row(name: str, ats: str, status: str, total, us: int, unknown: int, 
 
 
 def write_outputs(reports: list[CompanyReport], keywords: list[str], out_dir: str) -> None:
+    """Write summary.csv, us_locations.csv, jobs.csv and jobs.jsonl to out_dir.
+
+    summary.csv has every company (failed ones too, so nothing silently drops out) plus an
+    ALL row over successful companies. jobs.csv columns are listed in ``job_cols``; add a
+    Job field there to show it. jobs.jsonl has every Job field including the description.
+    """
     os.makedirs(out_dir, exist_ok=True)
 
     rows = [summary_row(r.company, r.ats, r.status, r.total_openings, r.us_openings, r.location_unknown,
@@ -285,6 +331,9 @@ def write_outputs(reports: list[CompanyReport], keywords: list[str], out_dir: st
         for r in ok:
             # a multi-state job counts once in each state; its city is only shown when it has one state
             def city_label(j: Job) -> str:
+                """City shown in us_locations.csv: "(multiple)" for a multi-state job, else its
+                city, "(remote)" or "(unknown)".
+                """
                 if len(j.states) > 1:
                     return "(multiple)"
                 return j.city or ("(remote)" if j.remote else "(unknown)")
@@ -321,6 +370,10 @@ def write_outputs(reports: list[CompanyReport], keywords: list[str], out_dir: st
 # --------------------------------------------------------------------------- #
 
 def main(argv: list[str] | None = None) -> int:
+    """Command-line entry point: read careers_results.csv, collect every company in parallel
+    (--workers), write the output files, then add the run to the SQLite database (unless
+    --no-db). Returns the process exit code (1 if the input has no usable rows).
+    """
     ap = argparse.ArgumentParser(description="Collect and classify job openings from detected job boards.")
     ap.add_argument("input", nargs="?", default="careers_results.csv", help="output CSV from find_careers.py")
     ap.add_argument("--out", default="output", help="output folder (default: output)")
