@@ -220,6 +220,174 @@ def test_full_pipeline_offline():
         conn.close()
 
 
+# --------------------------------------------------------------------------- #
+# edge cases: company identity, cut-short listings, capped runs, shared robots.txt, Workday states
+# --------------------------------------------------------------------------- #
+
+def test_company_identity():
+    from fetch_jobs import company_identity
+    # a pasted job board is keyed by the board, never by the ATS's domain
+    lilly = company_identity("https://lilly.wd115.myworkdayjobs.com/lly")
+    abbott = company_identity("https://abbott.wd5.myworkdayjobs.com/en-US/abbottcareers/job/123")
+    assert lilly == ("board:lilly.wd115.myworkdayjobs.com/lly", "")
+    assert abbott == ("board:abbott.wd5.myworkdayjobs.com/abbottcareers", "")
+    assert company_identity("https://jobs.ashbyhq.com/benchling")[0] != company_identity("https://jobs.ashbyhq.com/other")[0]
+    for url in ("https://boards.greenhouse.io/foo", "jobs.lever.co/bar", "https://jobs.ashbyhq.com/baz"):
+        key, _ = company_identity(url)
+        assert key.startswith("board:") and key not in ("greenhouse.io", "lever.co", "ashbyhq.com"), (url, key)
+    # homepages and careers pages: the registered domain, as before (keeps existing databases' keys)
+    assert company_identity("pfizer.com") == ("pfizer.com", "pfizer.com")
+    assert company_identity("https://careers.astrazeneca.com/") == ("astrazeneca.com", "astrazeneca.com")
+    assert company_identity("https://www.idexx.com/en/about-idexx/careers/") == ("idexx.com", "idexx.com")
+    assert company_identity("") == ("", "")
+
+
+class ShortBoard(FakeBoard):
+    """Says it has 100 jobs but the listing stops after 3 (an empty page mid-way)."""
+    name = "ShortATS"
+
+    def list_jobs(self, us_only=True):
+        jobs = super().list_jobs(us_only)
+        self.total_openings = self.expected_listed = 100
+        return jobs
+
+
+class EmptyBoard(FakeBoard):
+    name = "EmptyATS"
+
+    def list_jobs(self, us_only=True):
+        self.total_openings = 0
+        return []
+
+
+class ManyBoard(FakeBoard):
+    """Ten US jobs with known locations, two non-US and one unknown, for --max-jobs runs."""
+    name = "ManyATS"
+
+    def list_jobs(self, us_only=True):
+        jobs = []
+        for i in range(10):
+            j = self._job(f"M{i}", "Scientist I", url=f"https://fake.example/M{i}", description="BS required.")
+            apply_location(j, ["Boston, MA"])
+            jobs.append(j)
+        for i, loc in enumerate(["Basel, Switzerland", "Toronto, ON"]):
+            j = self._job(f"X{i}", "Scientist I", url=f"https://fake.example/X{i}")
+            apply_location(j, [loc])
+            jobs.append(j)
+        u = self._job("U1", "Scientist I", url="https://fake.example/U1", description="x")
+        apply_location(u, ["3 Locations"])
+        jobs.append(u)
+        self.total_openings = len(jobs)
+        return jobs
+
+    def enrich(self, job):
+        pass
+
+
+def _run_fake(board_cls, **overrides):
+    CLIENTS[board_cls.name] = board_cls
+    try:
+        row = {"input_url": "fakeco.com", "company": "FakeCo", "ats": board_cls.name, "status": "listings_found",
+               "listings_url": "https://fake.example/board", "careers_url": "", "rejected_requests": "",
+               "manual_check": "", "notes": ""}
+        args = argparse.Namespace(**{"all_locations": False, "max_jobs": 0, "detail_workers": 2, "delay": 0,
+                                     "timeout": 5, "ignore_robots": True, **overrides})
+        return process_company(row, args, {})
+    finally:
+        del CLIENTS[board_cls.name]
+
+
+def test_listing_completeness():
+    assert _run_fake(FakeBoard).listing_complete          # no board total: trusted
+    short = _run_fake(ShortBoard)
+    assert short.status == "ok" and not short.listing_complete
+    assert any("cut short (3 of 100" in n for n in short.notes)
+    empty = _run_fake(EmptyBoard)
+    assert empty.status == "ok" and not empty.listing_complete and empty.jobs == []
+    # the 95% tolerance: a job or two closing mid-run doesn't stop closures
+    c = ATSClient("https://x.example", "X", requests.Session())
+    c.expected_listed = 100
+    assert c.listing_complete(95) and c.listing_complete(100) and not c.listing_complete(94)
+    c.expected_listed = None
+    assert c.listing_complete(0)
+
+    # a cut-short or empty listing must not close the jobs it missed; a complete one still does
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "jobs.db")
+        expected = [(_run_fake(ManyBoard), 0, 10),   # 10 US jobs M0..M9
+                    (short, 0, 12),                  # F1, F3 added; the M jobs it missed stay open
+                    (empty, 0, 12),                  # nothing listed: nothing closed
+                    # complete listing: everything it doesn't list closes - the 10 M jobs and the 2
+                    # ShortATS ones (the ATS is part of a job's id, so FakeATS's F1/F3 are new jobs)
+                    (_run_fake(FakeBoard), 12, 2)]
+        for rep, closed, still_open in expected:
+            conn = database.open_db(path)
+            s = database.save_run(conn, database.start_run(conn, "t", {}, True, True), [rep], True, True)
+            conn.close()
+            assert (s["closed"], s["open_jobs"]) == (closed, still_open), (rep.ats, s)
+
+
+def test_capped_run_counts_whole_listing():
+    capped = _run_fake(ManyBoard, max_jobs=3)
+    assert len(capped.jobs) == 3                               # only the sample is classified and saved
+    assert capped.us_openings == 10 and capped.location_unknown == 1  # counts still cover the listing
+    full = _run_fake(ManyBoard)
+    assert (full.us_openings, full.location_unknown, len(full.jobs)) == (10, 1, 10)
+    assert _run_fake(ManyBoard, max_jobs=100).us_openings == 10   # a cap above the listing changes nothing
+
+
+class _CountingSession(requests.Session):
+    def __init__(self):
+        super().__init__()
+        self.robots_requests = 0
+
+    def get(self, url, **kw):
+        self.robots_requests += url.endswith("/robots.txt")
+        return _response(200, body=b"User-agent: *\nDisallow: /private\n", url=url)
+
+
+def test_robots_cache_shared_across_companies():
+    import ats_clients
+    ats_clients._ROBOTS_CACHE.pop("https://robots-test.example", None)
+    sessions = [_CountingSession() for _ in range(3)]
+    for s in sessions:  # three companies on the same job-board host
+        c = ATSClient("https://robots-test.example/board", "X", s, respect_robots=True)
+        c._check_robots("https://robots-test.example/api/jobs")
+        try:
+            c._check_robots("https://robots-test.example/private/x")
+            raise AssertionError("disallowed path was allowed")
+        except ats_clients.RobotsDisallowed:
+            pass
+    assert sum(s.robots_requests for s in sessions) == 1
+    ats_clients._ROBOTS_CACHE.pop("https://robots-test.example", None)
+
+
+def test_workday_state_lookup_stops_early():
+    from ats_clients import WorkdayClient
+    wd = WorkdayClient("https://acme.wd1.myworkdayjobs.com/External", "Acme", requests.Session())
+    wd.us_filtered, wd.facets = True, {"country": ["us"]}
+    wd.facet_data = {"facets": [{"facetParameter": "locationRegion", "values": [
+        {"descriptor": "California", "id": "ca", "count": 300},
+        {"descriptor": "Nebraska", "id": "ne", "count": 2},
+        {"descriptor": "Texas", "id": "tx", "count": 40},
+        {"descriptor": "Ontario", "id": "on", "count": 5},     # not a US state: skipped
+    ]}]}
+    calls = []
+    by_state = {"ne": [{"externalPath": "/job/a"}], "tx": [{"externalPath": "/job/b"}],
+                "ca": [{"externalPath": f"/job/c{i}"} for i in range(300)]}
+
+    def fake_all_postings(facets, first=None):
+        state = facets["locationRegion"][0]
+        calls.append(state)
+        return by_state.get(state, [])
+    wd._all_postings = fake_all_postings
+    a, b, known = (Job("Acme", "Workday", x, "t", is_us=True, meta={"path": f"/job/{x}"}) for x in ("a", "b", "c0"))
+    known.states = ["CA"]
+    wd.finalize([a, b, known])
+    assert a.states == ["NE"] and b.states == ["TX"] and known.states == ["CA"]
+    assert calls == ["ne", "tx"]  # smallest first, stopped before the 300-job state; Ontario never asked
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

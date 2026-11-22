@@ -13,6 +13,7 @@ from __future__ import annotations
 import html as htmllib
 import json
 import re
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -167,6 +168,14 @@ class RobotsDisallowed(Exception):
 
 
 ROBOTS_AGENT = "CareerSifter"
+# robots.txt per host, shared by every company in a run: many companies sit on the same job-board
+# hosts (api.lever.co, boards-api.greenhouse.io, api.smartrecruiters.com), so each is fetched once
+_ROBOTS_CACHE: dict[str, robotparser.RobotFileParser | None] = {}
+_ROBOTS_LOCKS: dict[str, threading.Lock] = {}
+_ROBOTS_GUARD = threading.Lock()
+# a listing that returns fewer than this share of the jobs the board reported is treated as cut
+# short (an empty page mid-way, a timeout), so the database won't mark the missing jobs closed
+COMPLETE_FRACTION = 0.95
 
 
 class ATSClient:
@@ -185,30 +194,43 @@ class ATSClient:
         self.total_openings: int | None = None   # all locations, if the ATS reports it
         self.us_filtered = False                 # True if list_jobs() returned US jobs only
         self.rejections: Counter[str] = Counter()  # "host 403 Cloudflare" -> times refused
-        self._robots: dict[str, robotparser.RobotFileParser | None] = {}
+        self._rejections_lock = threading.Lock()  # enrich() runs in several threads
+        # how many jobs the board said list_jobs() would return (its own total for the query made);
+        # None when the board gives no total (single-request APIs)
+        self.expected_listed: int | None = None
 
     def _check_robots(self, url: str) -> None:
         if not self.respect_robots:
             return
         p = urlparse(url)
         root = f"{p.scheme}://{p.netloc}"
-        if root not in self._robots:
-            rp = None
-            try:
-                r = self.session.get(root + "/robots.txt", timeout=self.timeout)
-                rp = robotparser.RobotFileParser()
-                if r.status_code == 200:
-                    rp.parse(r.text.splitlines())
-                elif r.status_code >= 500:  # RFC 9309: server error -> assume disallowed
-                    rp.disallow_all = True
-                else:                       # missing -> allowed
-                    rp.allow_all = True
-            except requests.RequestException:
-                rp = None
-            self._robots[root] = rp
-        rp = self._robots[root]
+        if root not in _ROBOTS_CACHE:
+            with _ROBOTS_GUARD:
+                lock = _ROBOTS_LOCKS.setdefault(root, threading.Lock())
+            with lock:  # one fetch per host even when several companies ask at once
+                if root not in _ROBOTS_CACHE:
+                    _ROBOTS_CACHE[root] = self._fetch_robots(root)
+        rp = _ROBOTS_CACHE[root]
         if rp is not None and not rp.can_fetch(ROBOTS_AGENT, url):
             raise RobotsDisallowed(f"robots.txt on {p.netloc} disallows {p.path}")
+
+    def _fetch_robots(self, root: str) -> robotparser.RobotFileParser | None:
+        try:
+            r = self.session.get(root + "/robots.txt", timeout=self.timeout)
+        except requests.RequestException:
+            return None  # unreachable: don't block on it
+        rp = robotparser.RobotFileParser()
+        if r.status_code == 200:
+            rp.parse(r.text.splitlines())
+        elif r.status_code >= 500:  # RFC 9309: server error -> assume disallowed
+            rp.disallow_all = True
+        else:                       # missing -> allowed
+            rp.allow_all = True
+        return rp
+
+    def listing_complete(self, n_listed: int) -> bool:
+        """Did list_jobs() get (nearly) every job the board said it has?"""
+        return self.expected_listed is None or n_listed >= COMPLETE_FRACTION * self.expected_listed
 
     def _request(self, method: str, url: str, **kw) -> requests.Response:
         self._check_robots(url)
@@ -217,7 +239,8 @@ class ATSClient:
         r = self.session.request(method, url, timeout=self.timeout, headers=headers, **kw)
         label = describe_rejection(r)
         if label:
-            self.rejections[f"{urlparse(r.url).netloc} {label}"] += 1
+            with self._rejections_lock:
+                self.rejections[f"{urlparse(r.url).netloc} {label}"] += 1
         r.raise_for_status()
         return r
 
@@ -305,6 +328,7 @@ class WorkdayClient(ATSClient):
                 self.facets, self.us_filtered = {param: [fid]}, True
                 self.facet_data = self._page(0, self.facets)
         postings = self._all_postings(self.facets, self.facet_data)
+        self.expected_listed = self.facet_data.get("total", 0)
 
         jobs = []
         for p in postings:
@@ -336,15 +360,17 @@ class WorkdayClient(ATSClient):
         missing = {j.meta["path"]: j for j in jobs if j.is_us and not j.states}
         if not missing or not self.us_filtered:
             return
-        for param, v in self._walk_facets(self.facet_data.get("facets", [])):
-            if not re.search(r"state|region|province", param, re.I) or not v.get("count"):
-                continue
-            ab = state_abbr(v.get("descriptor", ""))
-            if not ab:
-                continue
+        # each state costs a full listing of its jobs, so smallest states first (cheapest to read)
+        # and stop as soon as every job has a state. A multi-state job keeps the first state found.
+        states = [(param, v, state_abbr(v.get("descriptor", "")))
+                  for param, v in self._walk_facets(self.facet_data.get("facets", []))
+                  if re.search(r"state|region|province", param, re.I) and v.get("count")]
+        for param, v, ab in sorted((s for s in states if s[2]), key=lambda s: s[1].get("count", 0)):
             for p in self._all_postings({**self.facets, param: [v["id"]]}):
-                if (j := missing.get(p.get("externalPath"))) and ab not in j.states:
+                if (j := missing.pop(p.get("externalPath"), None)):
                     j.states.append(ab)
+            if not missing:
+                return
 
 
 class GreenhouseClient(ATSClient):
@@ -488,7 +514,7 @@ class SmartRecruitersClient(ATSClient):
                     filter(None, [loc.get("city"), loc.get("region"), loc.get("country")]))],
                     [loc.get("country", "")], [loc.get("region", "")], city=loc.get("city", ""))
                 jobs.append(job)
-        self.total_openings = total
+        self.total_openings = self.expected_listed = total
         return jobs
 
     def enrich(self, job):
@@ -534,7 +560,7 @@ class EightfoldClient(ATSClient):
                 if std and job.is_us is None:
                     job.is_us = False
                 jobs.append(job)
-        self.total_openings = total
+        self.total_openings = self.expected_listed = total
         return jobs
 
     def enrich(self, job):
@@ -581,7 +607,7 @@ class PhenomClient(ATSClient):
                 apply_location(job, j.get("multi_location") or [j.get("location", "")],
                                [j.get("country", "")], [j.get("state", "")], city=j.get("city", ""))
                 jobs.append(job)
-        self.total_openings = total
+        self.total_openings = self.expected_listed = total
         return jobs
 
     def enrich(self, job):
@@ -692,6 +718,7 @@ class ICIMSClient(ATSClient):
                                [j.get("state", "")], city=j.get("city", ""))
                 jobs.append(job)
         self.total_openings = total or len(jobs)
+        self.expected_listed = total or None
         return jobs
 
     # ---- detail (classic only; the API already includes descriptions) ------ #
@@ -742,6 +769,7 @@ class AttraxClient(ATSClient):
                 jobs.append(self._tile(t))
             page += 1
         self.total_openings = total or len(jobs)
+        self.expected_listed = total or None
         return jobs
 
     def _tile(self, tile) -> Job:
@@ -819,7 +847,7 @@ class OracleClient(ATSClient):
                                [r.get("PrimaryLocationCountry", "")] + [s.get("CountryCode", "") for s in second])
                 job.meta["arrangement"] = r.get("WorkplaceTypeCode") or r.get("WorkplaceType") or ""
                 jobs.append(job)
-        self.total_openings = total
+        self.total_openings = self.expected_listed = total
         return jobs
 
     def enrich(self, job):

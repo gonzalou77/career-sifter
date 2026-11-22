@@ -29,13 +29,12 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from statistics import median
-from urllib.parse import urlparse
 
 import database
 from ats_clients import CLIENTS, Job, RobotsDisallowed
 from classify import (EDU_NOT_STATED, EDU_ORDER, LEVEL_UNSPECIFIED, LEVELS, classify_education,
                       classify_level, infer_missing_states, min_years_experience)
-from find_careers import make_session, registered_domain
+from find_careers import make_session, site_key
 from job_details import extract_details, extract_salary
 
 log = logging.getLogger("career_sifter.jobs")
@@ -58,7 +57,12 @@ class CompanyReport:
     jobs: list[Job] = field(default_factory=list)   # US jobs (or all, with --all-locations)
     notes: list[str] = field(default_factory=list)
     manual_check: str = ""  # what to open by hand when the openings couldn't be collected
-    company_key: str = ""   # registered domain (pfizer.com): the company's id in the database
+    # the company's id in the database: its registered domain (pfizer.com), or for a job board pasted
+    # as the input, the board itself (board:lilly.wd115.myworkdayjobs.com/lly) - never the ATS's domain
+    company_key: str = ""
+    # False when the board returned clearly fewer jobs than it reported, or none at all:
+    # the database then marks nothing closed for this company
+    listing_complete: bool = True
 
 
 def load_keywords(spec: str | None) -> list[str]:
@@ -93,13 +97,29 @@ def classify_job(job: Job, kw_res: dict[str, re.Pattern]) -> None:
         job.work_arrangement = "remote"
 
 
+def company_identity(input_url: str) -> tuple[str, str]:
+    """(database key, company web domain) for an input URL.
+
+    A homepage or careers page is keyed by its registered domain (pfizer.com). A job board pasted
+    as the input is keyed by the board (same key as known_sites.csv), since its domain belongs to
+    the ATS: every pasted Workday board would otherwise be 'myworkdayjobs.com'. The company's own
+    domain is then unknown ("").
+    """
+    if not input_url.strip():
+        return "", ""
+    key = site_key(input_url.strip())
+    if key.startswith("board:"):
+        return key, ""
+    return key, key
+
+
 def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pattern]) -> CompanyReport:
     input_url = row.get("input_url", "")
-    domain = registered_domain(urlparse(input_url if "//" in input_url else "https://" + input_url).hostname)
-    company = row.get("company") or domain
+    key, domain = company_identity(input_url)
+    company = row.get("company") or domain or key
     ats = row.get("ats", "")
     board = row.get("listings_url") or row.get("careers_url", "")
-    rep = CompanyReport(company=company, ats=ats, board_url=board, company_key=domain or company.lower())
+    rep = CompanyReport(company=company, ats=ats, board_url=board, company_key=key or company.lower())
     finder_rejections = row.get("rejected_requests", "")
 
     if row.get("status") not in USABLE_STATUSES:  # blocked / not_found / error in find_careers
@@ -140,13 +160,22 @@ def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pa
         rep.manual_check = f"the job board could not be read - open {board} in a browser"
         return rep
     rep.total_openings = client.total_openings if client.total_openings is not None else len(jobs)
+    if not jobs:
+        rep.listing_complete = False
+        rep.notes.append("the job board returned no jobs - nothing marked closed; rerun to confirm")
+    elif not client.listing_complete(len(jobs)):
+        rep.listing_complete = False
+        rep.notes.append(f"listing cut short ({len(jobs)} of {client.expected_listed} jobs the board reported) - "
+                         f"nothing marked closed")
 
     # Jobs whose location we can't tell from the listing need the detail call to decide.
     targets = jobs if args.all_locations else [j for j in jobs if j.is_us is not False]
+    beyond_cap: list[Job] = []  # listed but not looked at in detail (--max-jobs)
     if args.max_jobs:
         if len(targets) > args.max_jobs:
-            rep.notes.append(f"capped at {args.max_jobs} of {len(targets)} jobs (--max-jobs)")
-        targets = targets[: args.max_jobs]
+            rep.notes.append(f"capped at {args.max_jobs} of {len(targets)} jobs (--max-jobs); US count beyond the "
+                             f"cap is from listing locations only")
+        targets, beyond_cap = targets[: args.max_jobs], targets[args.max_jobs:]
 
     def enrich(job: Job) -> None:
         if job.description and not job.meta.get("summary_only"):
@@ -171,8 +200,10 @@ def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pa
         rep.notes.append(f"{failed} job details could not be fetched (classified on title only)")
 
     selected = targets if args.all_locations else [j for j in targets if j.is_us]
-    rep.location_unknown = sum(1 for j in targets if j.is_us is None)
-    rep.us_openings = sum(1 for j in targets if j.is_us)
+    # counts cover the whole listing, not just the capped sample, so a --max-jobs run's
+    # US count and us_pct still describe the company
+    rep.location_unknown = sum(1 for j in targets + beyond_cap if j.is_us is None)
+    rep.us_openings = sum(1 for j in targets + beyond_cap if j.is_us)
     if client.us_filtered and not args.max_jobs:
         rep.notes.append("US count from the job board's own country filter")
     for j in selected:
@@ -315,6 +346,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     keywords = load_keywords(args.keywords)
     kw_res = keyword_res(keywords)
+    by_key: dict[str, list[str]] = {}
+    for r in rows:
+        key = company_identity(r.get("input_url", ""))[0]
+        if key:
+            by_key.setdefault(key, []).append(r.get("input_url", ""))
+    for key, urls in by_key.items():
+        if len(urls) > 1:
+            log.warning("note: %s appear to be the same company (%s); in the database they share one record, "
+                        "and its jobs are only marked closed if every one of them is collected", " and ".join(urls), key)
     log.info("Collecting jobs for %d companies...\n", len(rows))
 
     reports: list[CompanyReport | None] = [None] * len(rows)

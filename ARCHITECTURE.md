@@ -128,7 +128,7 @@ sequenceDiagram
         end
     end
     FJ->>FJ: write_outputs: CSV and JSONL
-    FJ->>DB: save_run: upsert jobs, snapshot,<br/>close jobs no longer listed (complete runs only)
+    FJ->>DB: save_run: upsert jobs, snapshot,<br/>close jobs no longer listed (complete runs,<br/>boards read in full, no blocked duplicate)
 ```
 
 ## 4. Classes
@@ -196,9 +196,11 @@ classDiagram
         +total_openings
         +us_filtered
         +rejections
+        +expected_listed
         +list_jobs(us_only) list~Job~
         +enrich(job)
         +finalize(jobs)
+        +listing_complete(n) bool
         -_check_robots(url)
     }
     class Job {
@@ -228,6 +230,7 @@ classDiagram
         us_openings
         jobs
         manual_check
+        listing_complete
     }
 
     ATSClient <|-- WorkdayClient

@@ -78,6 +78,13 @@ Added to database career_sifter.db (run 2): 85 new jobs, 1470 updated, 93 closed
 - **updated**: jobs seen before. Their details are refreshed and `last_seen` moves forward.
 - **closed**: jobs a previous run saw that this run's board no longer lists.
 
+A job is only marked closed when the run can be sure it is gone. That means the company's board was
+read successfully and returned (nearly) all the jobs it reported: at least 95% of its own total, and
+at least one job. A blocked board, a listing cut short by an empty page, or a board that suddenly
+returns nothing leaves the company's jobs open, with a note in `company_snapshots.notes`. If one
+company appears twice in the input (`pfizer.com` and `careers.pfizer.com`), its jobs are closed only
+when both rows were collected.
+
 Options:
 
 | Option | Effect |
@@ -215,7 +222,7 @@ FROM jobs WHERE is_open = 0 ORDER BY days_listed DESC LIMIT 20;
 | Table / view | One row per | Key columns |
 |---|---|---|
 | `runs` | run of `fetch_jobs.py` | `run_id`, `started_at`, `input_file`, `complete` (1 = not capped), `n_jobs` |
-| `companies` | company | `company_key` (domain, e.g. `pfizer.com`), `name`, `ats`, `board_url`, `first_seen`, `last_seen` |
+| `companies` | company | `company_key` (domain, e.g. `pfizer.com`; for a job board pasted as the input, the board itself, e.g. `board:lilly.wd115.myworkdayjobs.com/lly`), `name`, `ats`, `board_url`, `first_seen`, `last_seen` |
 | `company_snapshots` | company per run | `status`, `total_openings`, `us_openings`, `manual_check`, `rejected_requests` |
 | `jobs` | job | `job_uid` (company + platform + board job id), every column of `jobs.csv` plus the full `description`, `first_seen_at`, `last_seen_at`, `is_open`, `closed_at` |
 | `job_states` | job x state | `job_uid`, `state` |
@@ -386,7 +393,8 @@ Rscript tests/run_r_tests.R                     # the known-contents test databa
 
 Pointed at your database, it checks:
 - the tables are there;
-- data quality: each job appears once, salary minimum ≤ maximum, consistent open/closed dates, every open job has a link, valid state codes;
+- data quality: each job appears once, salary minimum ≤ maximum, the annual pay midpoint matches its range and period, consistent open/closed dates and run numbers, every open job has a link, valid state codes that agree with the `states` column, every row points at an existing company and run;
+- no company is keyed by a job-board platform's domain (e.g. `myworkdayjobs.com`), which would mean several companies had been merged; a database made before this was fixed can show it, and rerunning `fetch_jobs.py` doesn't repair old rows;
 - every query in this tutorial runs;
 - dplyr agrees with SQL;
 - the chart builds.

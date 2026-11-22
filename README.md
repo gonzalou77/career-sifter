@@ -181,7 +181,8 @@ Output (in `output/`):
 
 Every run also saves the jobs into a SQLite database, `career_sifter.db`. It's created on
 the first run and added to on every later run: new jobs are inserted, existing ones
-updated, and jobs a complete run no longer sees are marked closed. Nothing extra needs to
+updated, and jobs a complete run no longer sees are marked closed (never after a blocked board or a
+listing that came back cut short). Nothing extra needs to
 be installed, since SQLite is built into Python. `--db other.db` picks another file and
 `--no-db` skips it.
 
@@ -310,12 +311,13 @@ full path, e.g. `& "C:\Program Files\R\R-4.6.1\bin\Rscript.exe"`.)
 
 - **Any database:**
   - the expected tables and views exist;
-  - data quality: each job appears once, salary minimum ≤ maximum, valid pay periods, consistent open/closed dates, open jobs have a link, valid US state codes, no orphaned rows, documented career levels;
+  - data quality: each job appears once, salary minimum ≤ maximum, valid pay periods and currencies, annual pay midpoint consistent with range and period, consistent open/closed dates and run numbers, open jobs have a link, valid US state codes that match the `states` column, no orphaned rows, documented career levels;
+  - no company is keyed by a job-board platform's own domain (several companies merged into one);
   - every tutorial query runs;
   - tables load as data frames with dates that convert;
   - dplyr matches SQL;
   - the tutorial's ggplot chart builds.
-- **`tests/fixture.db` only:** exact answers on known contents. These include open jobs per company, top states, average pay by level, education counts, a job closed between runs, and a job updated across runs keeping its first-seen date. They're skipped on other databases.
+- **`tests/fixture.db` only:** exact answers on known contents. These include open jobs per company, top states, average pay by level, education counts, a job closed between runs, a job updated across runs keeping its first-seen date, the same job id at two companies staying two jobs, and a blocked board and a cut-short listing closing nothing. They're skipped on other databases.
 
 `tests/fixture.db` is built by `python test.py` (from `test_database.py`) and is
 git-ignored like other databases.

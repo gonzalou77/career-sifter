@@ -37,7 +37,8 @@ US_COUNTRY_NAMES = {"united states", "united states of america", "usa", "us", "u
 _STATE_NAME_RE = re.compile(
     r"\b(" + "|".join(re.escape(s) for s in sorted(US_STATES, key=len, reverse=True)) + r")\b", re.I)
 _DC_RE = re.compile(r"\bwashington,?\s*d\.?\s?c\.?(?![a-z])", re.I)
-_US_MARKER_RE = re.compile(r"\bunited states\b|(?<![A-Za-z])(?:US|USA|U\.S\.A?\.?)(?![A-Za-z])")
+# "United States" in any case; the short forms only in capitals ("us" is an English word)
+_US_MARKER_RE = re.compile(r"(?i:\bunited states\b)|(?<![A-Za-z])(?:US|USA|U\.S\.A?\.?)(?![A-Za-z])")
 _US_MARKER_CI_RE = re.compile(r"(?<![a-z])usa(?![a-z])", re.I)
 _STATE_ABBR_RES = [
     re.compile(r",\s*([A-Z]{2})(?:\s+\d{5}(?:-\d{4})?)?(?![A-Za-z])"),  # "Boston, MA" / "Boston, MA 02110"
@@ -58,6 +59,22 @@ _NON_US_CODE_RE = re.compile(
     r"NOR|DNK|FIN|POL|CZE|HUN|ROU|GRC|TUR|ISR|IND|CHN|JPN|KOR|SGP|AUS|NZL|TWN|HKG|PHL|MYS|THA|VNM|"
     r"IDN|ZAF|EGY|SAU|ARE)(?![A-Za-z])")
 _CA_PROVINCE_RE = re.compile(r",\s*(ON|QC|BC|AB|MB|NS|NB|NL|PE|SK)(?![A-Za-z])")
+# State codes that are also country codes, with that country's main cities:
+# "Bangalore, IN" is India and "Mississauga, CA" is Canada, while "Indianapolis, IN" and
+# "San Diego, CA" stay US. Only checked against "<city>, <code>", so "Milan, TN" is unaffected.
+_FOREIGN_CITIES_BY_CODE = {
+    "IN": r"bangalore|bengaluru|hyderabad|mumbai|pune|chennai|new delhi|delhi|gurgaon|gurugram|noida|kolkata|"
+          r"ahmedabad|vadodara|visakhapatnam|goa",
+    "CA": r"toronto|montr[eé]al|mississauga|vancouver|ottawa|calgary|edmonton|winnipeg|qu[eé]bec|laval|halifax|"
+          r"waterloo|kitchener|markham|oakville|guelph|saskatoon",
+    "DE": r"berlin|munich|m[üu]nchen|frankfurt|hamburg|cologne|k[öo]ln|heidelberg|mannheim|darmstadt|leverkusen|"
+          r"monheim|mainz|martinsried|penzberg",
+    "IL": r"tel aviv|rehovot|haifa|jerusalem|petah tikva|herzliya|ness ziona|caesarea",
+    "CO": r"bogot[aá]|medell[ií]n|cali",
+    "AR": r"buenos aires|c[oó]rdoba|rosario",
+}
+_FOREIGN_CITY_RES = {code: re.compile(r"(?i:\b(?:" + cities + r"))\s*,\s*" + code + r"(?![A-Za-z])")
+                     for code, cities in _FOREIGN_CITIES_BY_CODE.items()}
 _REMOTE_RE = re.compile(r"\bremote\b|\bvirtual\b|home[- ]based|work from home|\btelecommute", re.I)
 _CITY_RE = re.compile(r"([A-Z][A-Za-z.' ]+?),\s*(?:[A-Z]{2}(?![A-Za-z])|" + _STATE_NAME_RE.pattern[2:-2] + r")")
 _DASH_FMT_RE = re.compile(r"^(?:US|USA|United States(?: of America)?)\s*-\s*([^-]+?)\s*-\s*(.+)$", re.I)
@@ -103,8 +120,15 @@ def parse_location(text: str) -> LocationInfo:
     abbrs = [m.group(1) for rx in _STATE_ABBR_RES for m in rx.finditer(text) if m.group(1) in STATE_ABBRS]
     us_marker = bool(_US_MARKER_RE.search(text) or _US_MARKER_CI_RE.search(text))
     non_us = bool(_NON_US_RE.search(rest) or _NON_US_CODE_RE.search(text) or _CA_PROVINCE_RE.search(text))
+    for code, rx in _FOREIGN_CITY_RES.items():  # "Bangalore, IN": the code is India's, not Indiana's
+        n_foreign = len(rx.findall(text))
+        if code in abbrs and n_foreign:
+            n_comma = sum(1 for m in _STATE_ABBR_RES[0].finditer(text) if m.group(1) == code)
+            if n_foreign >= n_comma:  # every "<city>, IN" is a foreign city (else "..., Indianapolis, IN" stays)
+                abbrs = [a for a in abbrs if a != code]
+                non_us = True
 
-    # abbreviations alone are weak evidence ("Bangalore, IN" is India, not Indiana)
+    # abbreviations alone are weak evidence ("Bangalore, IN, India" is India, not Indiana)
     if non_us and not us_marker and not named:
         abbrs = []
     states = list(dict.fromkeys(named + abbrs))
@@ -233,13 +257,15 @@ def classify_education(text: str) -> tuple[list[str], str]:
 # Experience
 # --------------------------------------------------------------------------- #
 
+# (?<![\d.,]) : the number must start there, so "100 years of experience" (company history)
+# isn't read as "00" and "1,000 years" as "000"; "1.5 years" is read as 1.5, not 5.
 _YEARS_RE = re.compile(
-    r"(?:minimum of |at least )?(\d{1,2})\s*(?:\+|plus)?\s*(?:(?:-|–|to)\s*\d{1,2}\s*)?\+?\s*years?'?"
-    r"\s+(?:of\s+)?(?:[\w/,&()-]+\s+){0,6}?experience", re.I)
+    r"(?:minimum of |at least )?(?<![\d.,])(\d{1,2}(?:\.\d+)?)\s*(?:\+|plus)?\s*(?:(?:-|–|to)\s*\d{1,2}\s*)?\+?"
+    r"\s*years?'?\s+(?:of\s+)?(?:[\w/,&()-]+\s+){0,6}?experience", re.I)
 
 
 def min_years_experience(text: str) -> int | None:
-    years = [int(m.group(1)) for m in _YEARS_RE.finditer(_normalise(text))]
+    years = [int(float(m.group(1))) for m in _YEARS_RE.finditer(_normalise(text))]
     years = [y for y in years if y <= 30]
     return min(years) if years else None
 

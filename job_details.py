@@ -19,12 +19,22 @@ HOURS_PER_YEAR = 2080  # 40 h x 52 weeks, to compare hourly and salaried pay
 # --------------------------------------------------------------------------- #
 
 _CUR = r"(US\$|USD\s?\$?|C\$|CAD\s?\$?|\$|€|EUR\s?|£|GBP\s?)"
-_AMOUNT = r"(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)\s?([kK])?(?![\d,])"
+# (?!\d|,\d): the number ends here; a comma *after* it ("$110,000, plus bonus") is punctuation
+_AMOUNT = r"(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)\s?([kK])?(?!\d|,\d)"
 _RANGE_RE = re.compile(_CUR + r"\s?" + _AMOUNT + r"\s*(?:-|–|—|to|and)\s*(?:" + _CUR + r"\s?)?" + _AMOUNT)
 _SINGLE_RE = re.compile(_CUR + r"\s?" + _AMOUNT)
 _BIG_UNIT_RE = re.compile(r"^\s*(?:million|billion|mm\b|bn\b|m\b|b\b)", re.I)  # "$2.5 billion" is not pay
-_PAY_CONTEXT_RE = re.compile(r"salary|pay\b|pay range|compensation|wage|base|hiring range|hourly|rate|earn|"
-                             r"annual|per hour|per year", re.I)
+# whole words only: "rate" must not match "corporate", "base" "database", "earn" "learn"
+_PAY_CONTEXT_RE = re.compile(r"\b(?:salary|salaries|pay|pay range|compensation|wages?|base|hiring range|hourly|"
+                             r"rate|earn|earnings|annual(?:ly)?|per hour|per year)\b", re.I)
+# an amount that is a benefit or a one-off, not pay: "$25,000 in student loan repayment",
+# "$10,000 sign-on bonus", "a relocation allowance of up to $15,000" ("plus bonus" after a salary is fine)
+_NOT_PAY_NOUNS = (r"(?:tuition|student loans?|loans?|reimburse\w*|bonus(?:es)?|sign[- ]on|signing|stipends?|"
+                  r"relocation|allowances?|referral|grants?|awards?|donations?|scholarships?|revenue|funding|"
+                  r"investment|credits?)")
+_NOT_PAY_AFTER_RE = re.compile(r"^\s*(?:(?:in|of|for|toward|towards|per employee in)\s+)?(?:(?!plus\b|and\b|with\b)"
+                               r"\w+\s+){0,2}" + _NOT_PAY_NOUNS + r"\b", re.I)
+_NOT_PAY_BEFORE_RE = re.compile(r"\b" + _NOT_PAY_NOUNS + r"\b[^.$\n]{0,20}$", re.I)
 _PERIOD_RES = [
     ("hour", re.compile(r"^.{0,40}?(?:per|an|a|/)\s*(?:hour|hr)\b|^.{0,40}?\bhourly\b", re.I | re.S)),
     ("week", re.compile(r"^.{0,40}?(?:per|a|/)\s*week\b|^.{0,40}?\bweekly\b", re.I | re.S)),
@@ -97,6 +107,8 @@ def extract_salary(text: str) -> dict:
                 low, high = high, low
             before = text[max(0, m.start() - 200):m.start()]
             after = text[m.end():m.end() + 60]
+            if _NOT_PAY_AFTER_RE.match(after) or _NOT_PAY_BEFORE_RE.search(before):
+                continue  # a benefit / bonus / revenue figure
             context = bool(_PAY_CONTEXT_RE.search(before) or _PAY_CONTEXT_RE.search(after[:40]))
             if not is_range and not context:
                 continue
@@ -118,7 +130,11 @@ def extract_salary(text: str) -> dict:
 _REMOTE_RE = re.compile(r"\b(?:fully remote|100% remote|remote[- ]first|remote[- ]based|remote (?:position|role|"
                         r"opportunity|work|employee)|work (?:from home|remotely)|(?:this|the) (?:position|role|job) "
                         r"is (?:fully )?remote)\b", re.I)
-_HYBRID_RE = re.compile(r"\bhybrid\b", re.I)
+# not the science / IT senses: "hybrid capture" (sequencing), "hybrid seed" (agriculture), "hybrid cloud"
+_HYBRID_RE = re.compile(r"\bhybrid\b(?![- ](?:capture|cloud|seeds?|corn|maize|rice|wheat|sorghum|crops?|plants?|"
+                        r"vigou?r|breeding|varieties|variety|vehicles?|cells?|molecules?|proteins?|assays?|"
+                        r"materials?|IT\b|infrastructure|architecture|mass spec|imaging|technology|methods?)\b)",
+                        re.I)
 _ONSITE_RE = re.compile(r"\b(?:100% on-?site|fully on-?site|on-?site (?:position|role|presence|work|requirement|"
                         r"is required)|(?:requires?|required to be) (?:\w+ ){0,3}on-?site|site-based|office-based|"
                         r"in-office (?:position|role))\b", re.I)
@@ -128,10 +144,31 @@ _FIXED_RE = re.compile(r"\b(?:fixed[- ](?:term|duration)|limited[- ]term|tempora
                        r"employee|appointment)|term[- ]limited)\b", re.I)
 _CONTRACT_RE = re.compile(r"\b(?:contract(?:or)? (?:position|role|assignment|opportunity)|contract[- ]to[- ]hire|"
                           r"\b1099\b|W-?2 contract|this is a contract)\b", re.I)
+# "contract" as in a contract job, not "contract manufacturing" / "contract research organisation"
+_CONTRACT_WORD = (r"\bcontract\b(?!\s+(?:manufactur\w*|research|development|testing|lab\w*|organi[sz]ations?|"
+                  r"partners?|vendors?|sites?|negotiat\w*|management|review|terms?|services?|CDMO|CMO|CRO)\b)")
 _DURATION_RE = re.compile(
-    r"(?:fixed[- ](?:term|duration)|contract|temporary|assignment|duration|limited[- ]term|appointment)"
+    r"(?:\bfixed[- ](?:term|duration)|" + _CONTRACT_WORD + r"|\btemporary|\bassignment|\bduration|"
+    r"\blimited[- ]term|\bappointment)"
     r"[^.\n]{0,60}?\b(\d{1,2})[- ]?months?\b|\b(\d{1,2})[- ]?months?\b[^.\n]{0,40}?"
-    r"(?:contract|assignment|term|duration|appointment|fixed)", re.I)
+    r"(?:" + _CONTRACT_WORD + r"|\bassignment\b|(?<![-\w])term\b|\bduration\b|\bappointment\b|\bfixed\b)", re.I)
+# "at least 18 months", "within 12 months", "6 months of experience": not a contract length
+_NOT_DURATION_BEFORE_RE = re.compile(r"(?:at least|minimum(?: of)?|min\.?|within|after|first|every|past|over|"
+                                     r"last|next|least)\s*$", re.I)
+_NOT_DURATION_AFTER_RE = re.compile(r"^[- ]?months?\s+(?:of\s+)?(?:\w+\s+){0,2}experience", re.I)
+
+
+def contract_months(text: str) -> int | None:
+    """Length of a fixed-term / contract role in months, if the posting states one."""
+    for m in _DURATION_RE.finditer(text):
+        g = 1 if m.group(1) else 2
+        if _NOT_DURATION_BEFORE_RE.search(text[max(0, m.start(g) - 15):m.start(g)]) or \
+                _NOT_DURATION_AFTER_RE.match(text[m.end(g):m.end(g) + 50]):
+            continue
+        months = int(m.group(g))
+        if 1 <= months <= 48:
+            return months
+    return None
 _SHIFT_RE = re.compile(r"\b(1st|2nd|3rd|first|second|third|day|night|evening|overnight|weekend|rotating|swing|"
                        r"graveyard|(?:8|10|12)[- ]hour)\s+shifts?\b", re.I)
 _SHIFT_NORM = {"first": "1st", "second": "2nd", "third": "3rd", "graveyard": "overnight"}
@@ -153,8 +190,17 @@ _NO_RELOCATION_RE = re.compile(r"(?:no|not eligible for|without|does not include
                                r"relocation (?:assistance )?(?:is |will )?not (?:be )?(?:available|provided|offered)",
                                re.I)
 _BONUS_RE = re.compile(r"\bbonus(?:es)?\b", re.I)
-_EQUITY_RE = re.compile(r"\b(?:equity|stock options?|RSUs?|restricted stock|stock awards?|long[- ]term incentive)\b",
-                        re.I)
+_EQUITY_RE = re.compile(r"\b(?:equity|stock options?|RSUs?|restricted stock(?: units?)?|stock awards?|"
+                        r"stock[- ]based (?:compensation|awards?)|long[- ]term incentives?|LTIs?)\b", re.I)
+# "equity" that isn't compensation, removed before _EQUITY_RE looks: "diversity, equity and inclusion",
+# "health equity", "pay equity", "private equity", "DE&I"
+_NOT_EQUITY_RE = re.compile(
+    r"\b(?:diversity|inclusion|inclusive|belonging|health|healthcare|pay|racial|social|gender|educational|"
+    r"digital|access|accessibility|brand|private|home|shareholders?'?|stockholders?'?|treatment|internal|external|"
+    r"excellence|courage|joy|integrity|respect|fairness)"
+    r"[\s,&/-]+(?:and\s+|&\s*)?equity\b|\bequity[\s,&/-]+(?:and\s+|&\s*)?(?:inclusion|diversity|belonging|access|"
+    r"justice|research|investors?|firms?|partners?|funds?|joy|excellence|accounting|analysis)\b|"
+    r"\bequity[- ]minded\b", re.I)
 
 # Certifications / licences: name -> regex. Acronyms are case-sensitive; (?i:...) marks
 # the parts matched in any case.
@@ -227,12 +273,10 @@ def extract_details(text: str, title: str = "", employment_type: str = "", arran
         d["employment_term"] = "contract"
     elif "regular" in et or "permanent" in et:
         d["employment_term"] = "permanent"
-    if (m := _DURATION_RE.search(title + "\n" + text)) and d["employment_term"] in ("fixed-term", "contract",
-                                                                                  "internship", ""):
-        months = int(m.group(1) or m.group(2))
-        if 1 <= months <= 48:
-            d["contract_months"] = months
-            d["employment_term"] = d["employment_term"] or "fixed-term"
+    if d["employment_term"] in ("fixed-term", "contract", "internship", "") and \
+            (months := contract_months(title + "\n" + text)):
+        d["contract_months"] = months
+        d["employment_term"] = d["employment_term"] or "fixed-term"
 
     shifts = []
     for m in _SHIFT_RE.finditer(title + "\n" + text):
@@ -258,6 +302,6 @@ def extract_details(text: str, title: str = "", employment_type: str = "", arran
         # "may be available" (often standard wording on every posting) is not a firm offer
         d["relocation"] = "possible" if re.search(r"\bmay\b", m.group(0), re.I) else "offered"
     d["bonus"] = "yes" if _BONUS_RE.search(text) else ""
-    d["equity"] = "yes" if _EQUITY_RE.search(text) else ""
+    d["equity"] = "yes" if _EQUITY_RE.search(_NOT_EQUITY_RE.sub(" ", text)) else ""
     d["certifications"] = [name for name, rx in _CERT_RES.items() if rx.search(text)]
     return d

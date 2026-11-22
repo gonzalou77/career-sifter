@@ -65,6 +65,99 @@ def test_failed_company_closes_nothing():
         assert s["closed"] == 0 and s["open_jobs"] == 1
 
 
+def board_report(key, company, jobs, status="ok", complete=True):
+    return CompanyReport(company=company, ats="Workday", board_url="https://" + key.split(":", 1)[-1],
+                         status=status, total_openings=len(jobs), us_openings=len(jobs), jobs=jobs, company_key=key,
+                         listing_complete=complete)
+
+
+def test_pasted_boards_stay_separate():
+    """Two pasted Workday boards: separate companies, and the same requisition id at both is two jobs.
+    One of them blocked on the next run must not have its jobs closed by the other."""
+    lilly, abbott = "board:lilly.wd115.myworkdayjobs.com/lly", "board:abbott.wd5.myworkdayjobs.com/abbottcareers"
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "jobs.db")
+        s = run(path, [board_report(lilly, "lilly", [job("R1", "Scientist")]),
+                       board_report(abbott, "abbott", [job("R1", "Chemist"), job("R2", "Engineer")])])
+        assert (s["new"], s["companies"], s["open_jobs"]) == (3, 2, 3)
+        s = run(path, [board_report(lilly, "lilly", [job("R1", "Scientist")]),
+                       board_report(abbott, "abbott", [], status="blocked")])
+        assert s["closed"] == 0 and s["open_jobs"] == 3
+        conn = sqlite3.connect(path)
+        assert conn.execute("SELECT COUNT(*) FROM companies").fetchone() == (2,)
+        assert conn.execute("SELECT COUNT(DISTINCT company_key) FROM jobs WHERE job_id = 'R1'").fetchone() == (2,)
+        assert conn.execute("SELECT title FROM jobs WHERE company_key = ? AND job_id = 'R1'", (abbott,)).fetchone() \
+            == ("Chemist",)
+        conn.close()
+
+
+def test_same_company_twice_in_one_run():
+    """pfizer.com and careers.pfizer.com in one input share a key: one blocked row stops closures,
+    and the run's snapshot adds both rows' counts instead of keeping only the last."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "jobs.db")
+        run(path, [report([job("R1", "Scientist"), job("R2", "Engineer")])])
+        s = run(path, [report([job("R1", "Scientist")]), report([], status="blocked")])
+        assert s["closed"] == 0 and s["open_jobs"] == 2   # R2 may be listed on the blocked board
+        s = run(path, [report([job("R1", "Scientist")]), report([job("R3", "Analyst")])])
+        assert s["closed"] == 1 and s["open_jobs"] == 2   # both rows collected: R2 really closed
+        conn = sqlite3.connect(path)
+        snap = conn.execute("SELECT status, us_openings, jobs_saved FROM company_snapshots "
+                            "WHERE run_id = 2 AND company_key = 'lilly.com'").fetchone()
+        assert snap == ("ok+blocked", 1, 1)
+        assert conn.execute("SELECT us_openings FROM company_snapshots WHERE run_id = 3").fetchone() == (2,)
+        conn.close()
+
+
+def test_incomplete_listing_closes_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "jobs.db")
+        run(path, [report([job("R1", "Scientist"), job("R2", "Engineer")])])
+        rep = report([job("R1", "Scientist")])
+        rep.listing_complete = False
+        s = run(path, [rep])
+        assert s["closed"] == 0 and s["open_jobs"] == 2
+
+
+def test_duplicate_job_in_one_listing():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "jobs.db")
+        s = run(path, [report([job("R1", "Scientist"), job("R1", "Scientist", ("IN", "OH"))])])
+        assert (s["new"], s["updated"], s["total_jobs"]) == (1, 1, 1)
+        conn = sqlite3.connect(path)
+        assert sorted(conn.execute("SELECT state FROM job_states")) == [("IN",), ("OH",)]  # last copy wins
+        conn.close()
+
+
+def test_us_only_run_leaves_non_us_jobs():
+    """A US-only run can't see non-US jobs, so it must not close those saved by an --all-locations run."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "jobs.db")
+        basel = job("X1", "Chemist", states=())
+        basel.is_us = False
+        conn = database.open_db(path)
+        database.save_run(conn, database.start_run(conn, "t", {}, True, False), [report([job("R1", "S"), basel])],
+                          complete=True, us_only=False)
+        s = database.save_run(conn, database.start_run(conn, "t", {}, True, True), [report([job("R1", "S")])],
+                              complete=True, us_only=True)
+        conn.close()
+        assert s["closed"] == 0 and s["open_jobs"] == 2
+
+
+def test_reopened_job():
+    """A job that disappears and comes back is open again, with its first-seen run kept."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "jobs.db")
+        run(path, [report([job("R1", "Scientist"), job("R2", "Engineer")])])
+        run(path, [report([job("R1", "Scientist")])])
+        s = run(path, [report([job("R1", "Scientist"), job("R2", "Engineer")])])
+        assert s["closed"] == 0 and s["open_jobs"] == 2
+        conn = sqlite3.connect(path)
+        assert conn.execute("SELECT is_open, closed_at, first_seen_run, last_seen_run FROM jobs "
+                            "WHERE job_id = 'R2'").fetchone() == (1, None, 1, 3)
+        conn.close()
+
+
 def test_schema_upgrade():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "old.db")
@@ -109,12 +202,23 @@ def fixture_reports(run):
     else:
         lilly.append(fixture_job("Lilly", "R4", "Senior Engineer", "senior", ["TX"], ["Bachelor's"],
                                  120000, 140000))   # new in run 2
-    pfizer = [fixture_job("Pfizer", "P1", "Principal Scientist", "senior", ["NY"], ["PhD"]),
-              fixture_job("Pfizer", "P2", "Vice President, Research", "executive", ["NY"], ["PhD"], 300000, 400000)]
+    pfizer = [fixture_job("Pfizer", "P2", "Vice President, Research", "executive", ["NY"], ["PhD"], 300000, 400000)]
+    if run == 1:  # run 2's listing is cut short and misses P1: it must stay open
+        pfizer.insert(0, fixture_job("Pfizer", "P1", "Principal Scientist", "senior", ["NY"], ["PhD"]))
+    # a job board pasted as the input: keyed by the board, and its job id R1 is the same as Lilly's.
+    # Blocked on run 2: its job stays open.
+    acme = [fixture_job("Acme", "R1", "Lab Technician", "early", ["OH"], ["Bachelor's"])] if run == 1 else []
     return [CompanyReport(company="Lilly", ats="Workday", board_url="https://lilly.example/board", status="ok",
                           total_openings=640 + run, us_openings=len(lilly), jobs=lilly, company_key="lilly.com"),
             CompanyReport(company="Pfizer", ats="Workday", board_url="https://pfizer.example/board", status="ok",
-                          total_openings=700, us_openings=len(pfizer), jobs=pfizer, company_key="pfizer.com")]
+                          total_openings=700, us_openings=len(pfizer), jobs=pfizer, company_key="pfizer.com",
+                          listing_complete=run == 1),
+            CompanyReport(company="acme", ats="Workday", board_url="https://acme.wd1.myworkdayjobs.com/External",
+                          status="ok" if run == 1 else "blocked", total_openings=1 if run == 1 else None,
+                          us_openings=len(acme), jobs=acme, company_key=ACME_KEY)]
+
+
+ACME_KEY = "board:acme.wd1.myworkdayjobs.com/external"
 
 
 def build_fixture(path=FIXTURE_PATH):
@@ -133,15 +237,17 @@ def test_build_fixture():
     """Builds tests/fixture.db for the R tests and checks the values they rely on."""
     path = build_fixture()
     conn = sqlite3.connect(path)
-    assert conn.execute("SELECT COUNT(*), SUM(is_open) FROM jobs").fetchone() == (6, 5)
+    assert conn.execute("SELECT COUNT(*), SUM(is_open) FROM jobs").fetchone() == (7, 6)
     assert conn.execute("SELECT is_open FROM jobs WHERE job_id = 'R3'").fetchone() == (0,)
     assert conn.execute("SELECT first_seen_run FROM jobs WHERE job_id = 'R4'").fetchone() == (2,)
+    assert conn.execute("SELECT is_open, last_seen_run FROM jobs WHERE job_id = 'P1'").fetchone() == (1, 1)
+    assert conn.execute("SELECT is_open FROM jobs WHERE company_key = ?", (ACME_KEY,)).fetchone() == (1,)
+    assert conn.execute("SELECT COUNT(*) FROM companies").fetchone() == (3,)
     conn.close()
 
 
 if __name__ == "__main__":
-    test_create_then_add()
-    test_failed_company_closes_nothing()
-    test_schema_upgrade()
-    test_build_fixture()
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
     print("all database checks passed")

@@ -20,6 +20,27 @@ LOCATIONS = [
     ("Mexico City, Mexico", False, []),
     ("Remote", None, []),
     ("3 Locations", None, []),
+    # "United States" in title case (Pfizer / Workday wording) is a US marker
+    ("United States", True, []),
+    ("United States - Remote", True, []),
+    ("Virtual United States", True, []),
+    ("United States - Any Pfizer Site", True, []),
+    ("UNITED STATES OF AMERICA", True, []),
+    # state codes that are also country codes: the city decides
+    ("Bangalore, IN", False, []),
+    ("Hyderabad, IN", False, []),
+    ("Bengaluru, IN 560001", False, []),
+    ("Indianapolis, IN", True, ["IN"]),
+    ("Mississauga, CA", False, []),
+    ("San Diego, CA", True, ["CA"]),
+    ("Vancouver, WA", True, ["WA"]),        # the US Vancouver keeps its state
+    ("Berlin, DE", False, []),
+    ("Wilmington, DE", True, ["DE"]),
+    ("Rehovot, IL", False, []),
+    ("North Chicago, IL", True, ["IL"]),
+    ("Milan, TN", True, ["TN"]),            # a US town sharing a foreign city's name
+    ("Bangalore, IN | Indianapolis, IN", True, ["IN"]),  # one foreign, one US site
+    ("", None, []),
 ]
 
 EDUCATION = [
@@ -103,6 +124,16 @@ def test_years():
     assert min_years_experience("BS with 8+ years of relevant industry experience or PhD with 3 years experience") == 3
     assert min_years_experience("5-7 years of experience in GMP manufacturing") == 5
     assert min_years_experience("Founded 25 years ago") is None
+    # company history is not a requirement: "100" must not be read as "00"
+    assert min_years_experience("Building on over 100 years of experience in animal health.") is None
+    assert min_years_experience("With 1,000 years of combined experience. Requires 4+ years of experience.") == 4
+    assert min_years_experience("Our 170 years of experience; you bring 3 years of lab experience") == 3
+    assert min_years_experience("1.5 years of experience in a GMP lab") == 1   # not 5
+    assert min_years_experience("PhD with 0+ years of relevant experience") == 0  # a real zero stays
+    assert min_years_experience("") is None and min_years_experience(None) is None
+    assert min_years_experience("45 years of experience") is None  # above the 30-year sanity cap
+    assert classify_level("Scientist", "a heritage of 150 years of experience", "",
+                          min_years_experience("a heritage of 150 years of experience")) == ("unspecified", "")
 
 
 if __name__ == "__main__":

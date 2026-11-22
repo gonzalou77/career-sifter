@@ -108,7 +108,12 @@ def check_installation() -> None:
 
 def run_test_files(name_filter: str) -> None:
     print("\n2. Tests (every test_*.py file)")
-    for path in sorted(glob.glob(os.path.join(HERE, "test_*.py"))):
+    paths = sorted(glob.glob(os.path.join(HERE, "test_*.py")))
+    if not paths:
+        report("tests", "test files", "FAIL", f"no test_*.py files in {HERE}")
+        return
+    ran = 0
+    for path in paths:
         module_name = os.path.splitext(os.path.basename(path))[0]
         try:
             module = importlib.import_module(module_name)
@@ -118,18 +123,26 @@ def run_test_files(name_filter: str) -> None:
         tests = sorted((fn for name, fn in inspect.getmembers(module, inspect.isfunction)
                         if name.startswith("test_") and fn.__module__ == module_name),
                        key=lambda fn: fn.__code__.co_firstlineno)
+        if not tests:
+            report("tests", module_name, "INFO", "no test_ functions in this file")
         for fn in tests:
             label = f"{module_name}.{fn.__name__}"
             if name_filter and name_filter.lower() not in label.lower():
                 continue
+            ran += 1
             start = time.perf_counter()
             try:
                 fn()
                 report("tests", label, "PASS", f"{time.perf_counter() - start:.1f}s")
             except Exception as e:
-                frame = traceback.extract_tb(e.__traceback__)[-1]
+                # the deepest frame inside the project, so a failure in a library call still names the test line
+                frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename.startswith(HERE)]
+                frame = (frames or traceback.extract_tb(e.__traceback__))[-1]
                 where = f"{os.path.basename(frame.filename)}:{frame.lineno}"
-                report("tests", label, "FAIL", f"{type(e).__name__} at {where}: {str(e)[:200]}")
+                message = str(e)[:200] or (frame.line or "").strip()[:200]  # bare assert: show the line
+                report("tests", label, "FAIL", f"{type(e).__name__} at {where}: {message}")
+    if name_filter and not ran:
+        report("tests", f"-k {name_filter!r}", "FAIL", "no test name contains this text")
 
 
 # --------------------------------------------------------------------------- #
@@ -150,14 +163,22 @@ def run_live() -> None:
               "--db", os.path.join(d, "live.db")]),
         ]
         for label, cmd in steps:
-            p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                               timeout=300)
+            try:
+                p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                   timeout=300)
+            except subprocess.TimeoutExpired:
+                report("live", label, "FAIL", "took over 5 minutes - check your internet connection")
+                return
             if p.returncode != 0:
-                report("live", label, "FAIL", (p.stderr or p.stdout).strip().splitlines()[-1][:200])
+                lines = (p.stderr or p.stdout or "").strip().splitlines()
+                report("live", label, "FAIL", lines[-1][:200] if lines else f"exit code {p.returncode}, no output")
                 return
             if "find_careers" in cmd[1]:
                 with open(results_csv, encoding="utf-8") as f:
-                    row = next(csv.DictReader(f))
+                    row = next(csv.DictReader(f), None)
+                if row is None:
+                    report("live", label, "FAIL", "results CSV is empty")
+                    return
                 ok = row["status"] == "listings_found" and row["ats"]
                 report("live", label, "PASS" if ok else "FAIL",
                        f"{row['status']} [{row['ats']}] {row['listings_url']}" if ok else
@@ -166,11 +187,23 @@ def run_live() -> None:
                     return
             else:
                 with open(os.path.join(out, "summary.csv"), encoding="utf-8") as f:
-                    row = next(r for r in csv.DictReader(f) if r["company"] != "ALL")
+                    row = next((r for r in csv.DictReader(f) if r["company"] != "ALL"), None)
+                if row is None:
+                    report("live", label, "FAIL", "summary.csv has no company rows")
+                    return
                 ok = row["status"] == "ok" and int(row["us_openings"] or 0) > 0
-                report("live", label, "PASS" if ok else "FAIL",
-                       f"{row['total_openings']} openings, {row['us_openings']} US sampled, database written"
-                       if ok else f"{row['status']}: {row['notes'][:150]}")
+                db_ok = False
+                if ok:  # the database was created and holds the sampled jobs under the company's own key
+                    conn = sqlite3.connect(os.path.join(d, "live.db"))
+                    try:
+                        n, keys = conn.execute("SELECT COUNT(*), GROUP_CONCAT(DISTINCT company_key) FROM jobs").fetchone()
+                    finally:
+                        conn.close()
+                    db_ok = 0 < n <= 3 and keys == "benchling.com"
+                report("live", label, "PASS" if ok and db_ok else "FAIL",
+                       f"{row['total_openings']} openings, {row['us_openings']} US, database written" if ok and db_ok
+                       else f"{row['status']}: {row['notes'][:150]}" if not ok else
+                       f"database check failed: {n} jobs under key {keys!r}")
 
 
 # --------------------------------------------------------------------------- #
@@ -191,8 +224,12 @@ def run_r() -> None:
     if not rscript:
         report("r", "R installed", "SKIP", "Rscript not found - see DATABASE.md section 7.1")
         return
-    if not os.path.exists(os.path.join(HERE, "tests", "fixture.db")):
-        report("r", "tests/fixture.db", "FAIL", "missing - run python test.py once without -k to build it")
+    # always rebuild the fixture first: a -k run skips test_build_fixture, and a fixture left over from an
+    # older version of the code would make the R exact-answer checks fail for the wrong reason
+    try:
+        importlib.import_module("test_database").build_fixture()
+    except Exception as e:
+        report("r", "build tests/fixture.db", "FAIL", f"{type(e).__name__}: {e}")
         return
     p = subprocess.run([rscript, os.path.join("tests", "run_r_tests.R")], cwd=HERE, capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=600)  # R prints UTF-8 box characters
