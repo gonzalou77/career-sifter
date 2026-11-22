@@ -63,6 +63,9 @@ class CompanyReport:
     # False when the board returned clearly fewer jobs than it reported, or none at all:
     # the database then marks nothing closed for this company
     listing_complete: bool = True
+    # "ats|job_id" of every job the board listed this run, saved or not: a listed job whose location
+    # couldn't be told (detail page failed) is still open, so the database must not close it
+    listed_ids: set[str] = field(default_factory=set)
 
 
 def load_keywords(spec: str | None) -> list[str]:
@@ -159,6 +162,7 @@ def process_company(row: dict, args: argparse.Namespace, kw_res: dict[str, re.Pa
         rep.manual_check = f"the job board could not be read - open {board} in a browser"
         return rep
     rep.total_openings = client.total_openings if client.total_openings is not None else len(jobs)
+    rep.listed_ids = {f"{j.ats}|{j.job_id}" for j in jobs}
     if not jobs:
         rep.listing_complete = False
         rep.notes.append("the job board returned no jobs - nothing marked closed; rerun to confirm")

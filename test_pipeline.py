@@ -297,6 +297,38 @@ def _run_fake(board_cls, **overrides):
         del CLIENTS[board_cls.name]
 
 
+class FlakyDetailBoard(FakeBoard):
+    """One job whose listing gives no usable location ("3 Locations"); its detail page says where it is,
+    unless the board is throttling detail requests."""
+    name = "FlakyATS"
+    fail = False
+
+    def list_jobs(self, us_only=True):
+        return [self._job("L1", "Scientist", locations=["3 Locations"])]
+
+    def enrich(self, job):
+        if FlakyDetailBoard.fail:
+            raise ConnectionError("429 Too Many Requests")
+        job.description = "Based in Boston, MA."
+        apply_location(job, ["Boston, MA"])
+
+
+def test_failed_detail_does_not_close_listed_job():
+    with tempfile.TemporaryDirectory() as d:
+        conn = database.open_db(os.path.join(d, "jobs.db"))
+        try:
+            for fail in (False, True):  # run 1 saves the job; run 2 can't read its detail page
+                FlakyDetailBoard.fail = fail
+                rep = _run_fake(FlakyDetailBoard)
+                run_id = database.start_run(conn, "t", {}, complete=True, us_only=True)
+                stats = database.save_run(conn, run_id, [rep], complete=True, us_only=True)
+        finally:
+            FlakyDetailBoard.fail = False
+            conn.close()
+    assert rep.jobs == [] and rep.listed_ids == {"FlakyATS|L1"}  # not classified, but listed
+    assert (stats["closed"], stats["open_jobs"]) == (0, 1), stats
+
+
 def test_listing_completeness():
     assert _run_fake(FakeBoard).listing_complete          # no board total: trusted
     short = _run_fake(ShortBoard)

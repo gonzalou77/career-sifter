@@ -93,7 +93,8 @@ runs with the same input list, each saved company starts straight from its **sav
   e.g. *"no job board detected - open https://www.schrodinger.com/company/careers/ in a
   browser, find the openings and paste the job listings URL into listings_url in
   known_sites.csv"*. Later runs skip these (0 requests) instead of repeating the same
-  search, until `--recheck-days` (default 30) have passed or you use `--refresh`.
+  search, until `--recheck-days` (default 30) have passed or you use `--refresh`. A scan that
+  ended in `error` (timeout, site down) is always retried on the next run.
   Once you paste the job board into `listings_url`, the next run uses it
   (`method` = `manual (known_sites.csv)`).
 - The `requests` column shows how many HTTP requests each company cost. In testing, a

@@ -103,6 +103,8 @@ def extract_salary(text: str) -> dict:
             high = _amount(g[4], g[5]) if is_range else low
             if is_range and g[2] and not g[5]:  # "$150K - 200": same unit on both
                 high *= 1000
+            elif is_range and g[5] and not g[2]:  # "$120 - $150K", "$60-80k": the K covers both
+                low *= 1000
             if high < low:
                 low, high = high, low
             before = text[max(0, m.start() - 200):m.start()]

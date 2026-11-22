@@ -83,7 +83,9 @@ read successfully and returned (nearly) all the jobs it reported: at least 95% o
 at least one job. A blocked board, a listing cut short by an empty page, or a board that suddenly
 returns nothing leaves the company's jobs open, with a note in `company_snapshots.notes`. If one
 company appears twice in the input (`pfizer.com` and `careers.pfizer.com`), its jobs are closed only
-when both rows were collected.
+when both rows were collected. A job the board still lists but that couldn't be saved this run (its
+detail page failed, so its location couldn't be confirmed) also stays open: its `last_seen` moves
+forward and its stored details are kept.
 
 Options:
 

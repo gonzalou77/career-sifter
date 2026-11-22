@@ -233,6 +233,23 @@ def build_fixture(path=FIXTURE_PATH):
     return path
 
 
+def test_listed_but_unsaved_job_stays_open():
+    """A job still on the board but not saved this run (its detail page failed, so it couldn't be
+    confirmed as US) must not be marked closed; a job that's gone from the board still is."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "jobs.db")
+        run(path, [report([job("R1", "Scientist"), job("R2", "Engineer")])])
+        rep = report([])  # neither job saved this time...
+        rep.listed_ids = {"Workday|R1"}  # ...but R1 is still listed
+        s = run(path, [rep])
+        assert s["closed"] == 1
+        conn = sqlite3.connect(path)
+        assert conn.execute("SELECT is_open, last_seen_run, title FROM jobs WHERE job_id = 'R1'").fetchone() == \
+            (1, 2, "Scientist")  # seen this run, stored details kept
+        assert conn.execute("SELECT is_open FROM jobs WHERE job_id = 'R2'").fetchone() == (0,)
+        conn.close()
+
+
 def test_build_fixture():
     """Builds tests/fixture.db for the R tests and checks the values they rely on."""
     path = build_fixture()

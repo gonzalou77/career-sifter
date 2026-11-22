@@ -3,6 +3,9 @@ from job_details import extract_details, extract_salary, normalise_arrangement
 
 SALARIES = [
     # (text, (min, max, currency, period, annual_mid) or None)
+    # a K on the upper amount only covers both (was read as "$120 an hour")
+    ("The salary range is $120 - $150K per year.", (120000, 150000, "USD", "year", 135000)),
+    ("Salary range $60-80k", (60000, 80000, "USD", "year", 70000)),
     ("Actual compensation will depend on a candidate's education. The anticipated wage for this position is\n"
      "$72,000 - $189,200\nFull-time equivalent employees also will be eligible for a company bonus",
      (72000, 189200, "USD", "year", 130600)),                           # Lilly

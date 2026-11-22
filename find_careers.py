@@ -1066,7 +1066,10 @@ class SiteScanner:
     def scan(self) -> Result:
         try:
             self._scan()
-            if not self.result.ats:
+            # guess board addresses only from a company's own domain: for a pasted or saved job board
+            # that failed, the domain is the ATS's (greenhouse.io -> "greenhouse"), and the guess would
+            # find the ATS vendor's own board. main() rediscovers a failed saved board from the input.
+            if not self.result.ats and self.result.input_type != "job_board" and not detect_ats(self.base_domain):
                 found = self.probe_ats_boards()
                 if found:
                     self.result.ats, self.result.listings_url = found
@@ -1083,8 +1086,10 @@ class SiteScanner:
         self.result.manual_check = manual_check_note(self.result)
         if self.result.status in ("blocked", "error"):
             # the site couldn't be loaded: say why, and what to paste in. robots.txt first, since
-            # retrying the same page won't help (not_found keeps its own "search for it" note)
-            if self.robots_skipped:
+            # retrying the same page won't help (not_found keeps its own "search for it" note). But a
+            # careers page that was refused by the server is the real cause, even if one of its
+            # search pages tried afterwards was robots-disallowed.
+            if self.robots_skipped and (not self.careers_failed or self.robots_skipped == self.careers_failed):
                 self.result.manual_check = robots_note(self.robots_skipped)
             elif self.careers_failed:
                 self.result.manual_check = careers_failed_note(self.careers_failed)
@@ -1270,7 +1275,8 @@ def main(argv: list[str] | None = None) -> int:
         # an explicit careers_url in the input wins over a saved entry
         entry = None if (careers or args.refresh) else known.get(key)
         if entry and needs_manual(entry):
-            if checked_recently(entry, args.recheck_days):
+            # an "error" (timeout, site down, crash) may be temporary: always retry it
+            if checked_recently(entry, args.recheck_days) and entry.get("status") != "error":
                 # nothing new to find yet: don't repeat the same search, point at the manual step
                 r = Result(input_url=url, company=name or entry.get("company", ""), source="known",
                            status=entry.get("status") or "careers_page_found",

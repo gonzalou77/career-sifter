@@ -192,6 +192,13 @@ def save_run(conn: sqlite3.Connection, run_id: int, reports, complete: bool, us_
                 rows.append([uid, key] + [_value(c, getattr(job, c)) for c in JOB_COLUMNS] + [run_id, run_id, now, now])
                 uids.append((uid,))
             conn.executemany(upsert, rows)
+            # still on the board but not saved this run (e.g. its detail page failed, so it couldn't
+            # be confirmed as US): it was seen, so it stays open; its stored details are left as they were
+            saved = {u for (u,) in uids}
+            conn.executemany("UPDATE jobs SET last_seen_run = ?, last_seen_at = ?, is_open = 1, closed_at = NULL "
+                             "WHERE job_uid = ?",
+                             [(run_id, now, uid) for uid in (f"{key}|{i}" for i in getattr(rep, "listed_ids", ()))
+                              if uid not in saved])
             for table, (col, attr) in CHILD_TABLES.items():
                 conn.executemany(f"DELETE FROM {table} WHERE job_uid = ?", uids)
                 conn.executemany(f"INSERT OR IGNORE INTO {table}(job_uid, {col}) VALUES (?, ?)",

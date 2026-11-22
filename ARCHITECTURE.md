@@ -56,13 +56,14 @@ note when a person needs to look, and an update to `known_sites.csv`.
 %%{init: {"flowchart": {"htmlLabels": false}} }%%
 flowchart TD
     start(["input row"]) --> saved{"saved entry in<br/>known_sites.csv?"}
-    saved -->|"no board, checked<br/>within 30 days"| skip["skip: 0 requests,<br/>repeat the<br/>manual-check note"]
+    saved -->|"no board, checked<br/>within 30 days<br/>(not an error)"| skip["skip: 0 requests,<br/>repeat the<br/>manual-check note"]
     saved -->|"has board or<br/>careers page"| useSaved["start from the<br/>saved board or<br/>careers page"]
-    saved -->|"no, or --refresh"| kind{"what kind<br/>of URL?"}
+    saved -->|"no, --refresh,<br/>or last scan<br/>was an error"| kind{"what kind<br/>of URL?"}
     useSaved -->|works| done
     useSaved -->|"404 or failed"| kind
 
     kind -->|"job board"| board["use it as-is,<br/>no crawling"]
+    board -->|"404 or 410"| deadBoard(["not_found: no<br/>address guessing<br/>(the domain is the<br/>ATS's, not the<br/>company's)"])
     kind -->|"careers page"| careers["fetch the careers<br/>page; homepage is<br/>never requested"]
     kind -->|homepage| home["fetch the homepage<br/>(also www. and<br/>http://)"]
 
@@ -83,10 +84,10 @@ flowchart TD
     listings -->|"ATS found"| done(["listings_found"])
     listings -->|"no ATS"| probe
 
-    probe["workaround: guess<br/>board addresses:<br/>Workday data centre<br/>and site names; iCIMS,<br/>Greenhouse, Lever,<br/>Ashby, SmartRecruiters"]
+    probe["workaround: guess<br/>board addresses from<br/>the company's domain:<br/>Workday data centre<br/>and site names; iCIMS,<br/>Greenhouse, Lever,<br/>Ashby, SmartRecruiters"]
     probe -->|found| done
-    probe -->|nothing| manual(["careers_page_found,<br/>not_found or blocked,<br/>plus a manual-check<br/>note: open the page,<br/>paste the board into<br/>known_sites.csv"])
-    board --> done
+    probe -->|nothing| manual(["careers_page_found,<br/>not_found or blocked,<br/>plus a manual-check<br/>note: robots.txt only<br/>if it blocked the entry<br/>page, else open the<br/>page and paste the<br/>board into<br/>known_sites.csv"])
+    board -->|loads| done
 ```
 
 ## 3. Collecting one company's jobs
@@ -113,7 +114,7 @@ sequenceDiagram
         C->>B: listing API / pages (Workday uses its own US filter)
         B-->>C: openings with title, location, maybe salary
         C-->>FJ: Job records + total_openings
-        Note over FJ: keep US jobs and unknown locations
+        Note over FJ: record every listed job id (listed_ids),<br/>keep US jobs and unknown locations
         par each job without a full description
             FJ->>C: enrich(job)
             C->>B: job page / detail API
@@ -128,7 +129,7 @@ sequenceDiagram
         end
     end
     FJ->>FJ: write_outputs: CSV and JSONL
-    FJ->>DB: save_run: upsert jobs, snapshot,<br/>close jobs no longer listed (complete runs,<br/>boards read in full, no blocked duplicate)
+    FJ->>DB: save_run: upsert jobs, snapshot,<br/>mark listed-but-unsaved jobs as seen (detail failed),<br/>close jobs no longer listed (complete runs,<br/>boards read in full, no blocked duplicate)
 ```
 
 ## 4. Classes
@@ -231,6 +232,7 @@ classDiagram
         jobs
         manual_check
         listing_complete
+        listed_ids
     }
 
     ATSClient <|-- WorkdayClient

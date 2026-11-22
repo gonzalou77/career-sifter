@@ -157,7 +157,44 @@ def test_robots_disallowed_site_is_skipped_with_message():
     assert r.status == "not_found" and "search 'example.com careers'" in r.manual_check
 
 
+def test_failed_board_is_not_guessed_from_ats_domain():
+    """A pasted job board that answers 404 must not guess boards from the ATS's own domain
+    (boards.greenhouse.io -> slug "greenhouse" would find Greenhouse's own job board)."""
+    import argparse
+    from find_careers import Page, SiteScanner
+    args = argparse.Namespace(ignore_robots=True, timeout=5, delay=0, render=False, verify=3)
+    s = SiteScanner("https://boards.greenhouse.io/deadco", "", args)
+    s.fetch = lambda url: Page(url=url, status=404)
+    guessed = []
+    s.probe_ats_boards = lambda: guessed.append(s.base_domain)
+    r = s.scan()
+    assert r.status == "not_found" and r.input_type == "job_board" and guessed == [], (r.status, guessed)
+
+
+def test_refused_careers_page_is_not_blamed_on_robots():
+    """The careers page was refused (403); a search page tried afterwards was robots-disallowed.
+    The message should be about the careers page, not robots.txt."""
+    from find_careers import Page
+    s = _scanner("example.com", careers_url="https://careers.example.com/")
+    s.allowed = lambda url: "/search/" not in url
+
+    def fetch(url):  # careers page refused, its search pages missing, /search/?q= robots-disallowed
+        if not s.allowed(url):
+            return s.get(url)
+        return Page(url=url, status=403 if url == "https://careers.example.com/" else 404)
+    s.fetch = fetch
+    r = s.scan()
+    assert r.status == "error" and "robots.txt disallows" in r.notes
+    assert r.manual_check.startswith("the careers page https://careers.example.com/ could not be loaded"), \
+        r.manual_check
+    # the careers page itself disallowed: robots.txt is the reason
+    r = _scanner("https://careers.example.com/", robots_allows=False).scan()
+    assert r.manual_check.startswith("skipped: robots.txt on careers.example.com")
+
+
 if __name__ == "__main__":
+    test_failed_board_is_not_guessed_from_ats_domain()
+    test_refused_careers_page_is_not_blamed_on_robots()
     test_classify_input()
     test_load_sites_csv_careers_column()
     test_site_key()
